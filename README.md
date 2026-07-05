@@ -17,6 +17,7 @@ the ever-growing conversation history that silently eats your usage limits.
 - [The problem](#the-problem)
 - [The solution](#the-solution)
 - [Quickstart](#quickstart)
+- [What works with Tokensnap (and what doesn't)](#what-works-with-tokensnap-and-what-doesnt)
 - [Commands](#commands)
 - [Configuration](#configuration)
 - [How Memory Card compression works](#how-memory-card-compression-works)
@@ -121,6 +122,44 @@ Both views show two sets of numbers:
 > Code — a new request row should appear within a second or two. If nothing
 > shows up, Claude Code isn't using the proxy (see
 > [Estimated vs. real tokens](#estimated-vs-real-tokens)).
+
+## What works with Tokensnap (and what doesn't)
+
+| Client | Supported? | How |
+| --- | --- | --- |
+| Claude Code (CLI) | ✅ | `tokensnap run claude`, or set `ANTHROPIC_BASE_URL` |
+| Claude Code in VS Code / JetBrains | ✅ | Set `ANTHROPIC_BASE_URL` as a persistent user env var (see below) |
+| Any Anthropic SDK/API app (Aider, Cline, custom scripts) | ✅ | Point its Anthropic base URL at `http://127.0.0.1:8889` |
+| **Claude Desktop / claude.ai (the chat app)** | ❌ | Not possible — see below |
+
+**Why the Claude Desktop chat app can't benefit:** the desktop app doesn't
+resend your conversation history from your machine — chats live on Anthropic's
+servers and the app only transmits your new message, so there is no
+client-side context bloat for a proxy to strip. It also uses claude.ai's
+private protocol (not the public `/v1/messages` API) and ignores
+`ANTHROPIC_BASE_URL` entirely. For the chat app, the practical levers are:
+start new chats instead of continuing very long ones, avoid re-pasting large
+documents (use Projects), and move heavy coding work to Claude Code routed
+through Tokensnap.
+
+**Routing every Claude Code session automatically** (instead of using
+`tokensnap run` each time) — set the variable persistently:
+
+```powershell
+# PowerShell (Windows)
+[System.Environment]::SetEnvironmentVariable("ANTHROPIC_BASE_URL", "http://127.0.0.1:8889", "User")
+```
+
+```bash
+# bash/zsh (Linux/macOS) - add to ~/.bashrc or ~/.zshrc
+export ANTHROPIC_BASE_URL=http://127.0.0.1:8889
+```
+
+> ⚠️ With the variable set persistently, Claude Code **requires** the proxy to
+> be running — if it's down you'll get connection errors. Keep
+> `tokensnap start` running (or add it to your startup apps), or skip this and
+> stick with `tokensnap run claude`. To undo on Windows:
+> `[System.Environment]::SetEnvironmentVariable("ANTHROPIC_BASE_URL", $null, "User")`
 
 ## Commands
 
