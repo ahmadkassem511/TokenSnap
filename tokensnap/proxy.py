@@ -7,6 +7,7 @@ streams) are relayed back untouched. The API key travels in the request
 headers Claude Code already sends; the proxy never stores it.
 """
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -16,7 +17,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import aiohttp
 from aiohttp import web
 
-from tokensnap import cleaner, compressor, stats, token_counter
+from tokensnap import cleaner, compressor, ollama, stats, token_counter
 from tokensnap.utils import transform_message_text
 
 log = logging.getLogger("tokensnap.proxy")
@@ -121,11 +122,13 @@ def optimize_body(
     # 1. Clean terminal noise out of every text payload
     messages = _clean_messages(messages)
 
-    # 2. Compress old history into a Memory Card
+    # 2. Compress old history into a Memory Card (LLM-assisted when a
+    #    local Ollama server is available; regex otherwise)
     card, messages = compressor.compress_messages(
         messages,
         keep_last_n=int(cfg["keep_last_n"]),
         min_messages=int(cfg["min_messages_to_compress"]),
+        llm_cfg=cfg,
     )
     if card:
         system = _append_to_system(system, card)
@@ -140,6 +143,7 @@ def optimize_body(
             messages,
             keep_last_n=int(cfg["aggressive_keep_last_n"]),
             min_messages=int(cfg["aggressive_keep_last_n"]) * 2,
+            llm_cfg=cfg,
         )
         if card:
             system = _append_to_system(system, card)
@@ -186,6 +190,18 @@ class TokensnapProxy:
             self.cfg["upstream"],
             extra={"markup": True},
         )
+        if ollama.enabled(self.cfg):
+            if await asyncio.to_thread(ollama.is_available, self.cfg):
+                log.info(
+                    "Memory Cards: local LLM via Ollama (%s at %s), regex fallback",
+                    self.cfg.get("ollama_model"),
+                    self.cfg.get("ollama_url"),
+                )
+            else:
+                log.info("Memory Cards: regex (no Ollama server at %s)",
+                         self.cfg.get("ollama_url"))
+        else:
+            log.info("Memory Cards: regex (llm_compressor=off)")
 
     async def _on_cleanup(self, app: web.Application) -> None:
         if self.session:
@@ -200,7 +216,11 @@ class TokensnapProxy:
         if request.method == "POST" and request.path in OPTIMIZED_PATHS:
             try:
                 body = json.loads(raw)
-                optimized, meta = optimize_body(body, self.cfg)
+                # Worker thread: optimization may block on a local LLM call
+                # and must not stall other in-flight requests
+                optimized, meta = await asyncio.to_thread(
+                    optimize_body, body, self.cfg
+                )
                 body_bytes = json.dumps(optimized, ensure_ascii=False).encode("utf-8")
             except (json.JSONDecodeError, UnicodeDecodeError):
                 log.debug("Non-JSON body on %s; forwarding verbatim", request.path)

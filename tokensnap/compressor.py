@@ -2,7 +2,10 @@
 "Memory Card" — a JSON block capturing the task, files touched, decisions
 made, and errors resolved — while keeping the last N exchanges verbatim.
 
-Rule-based (regex) extraction only; no LLM calls. Pure and offline-testable.
+Extraction is rule-based (regex) by default: pure and offline-testable.
+When a config dict is passed via `llm_cfg` and a local Ollama server is
+available, the regex card is upgraded with an LLM-written summary (see
+tokensnap.ollama); regex remains the fallback on any failure.
 """
 
 import json
@@ -40,8 +43,16 @@ def _clip(line: str) -> str:
     return line if len(line) <= _MAX_LINE else line[: _MAX_LINE - 1] + "…"
 
 
-def build_memory_card(messages: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """Extract key facts from a list of messages into a compact dict."""
+def build_memory_card(
+    messages: List[Dict[str, Any]],
+    llm_cfg: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Extract key facts from a list of messages into a compact dict.
+
+    With `llm_cfg` (the Tokensnap config), a local Ollama model is asked
+    for a better summary; its output is merged over the regex card (regex
+    stays the baseline for file paths, which it extracts reliably).
+    """
     files: List[str] = []
     decisions: List[str] = []
     errors_resolved: List[str] = []
@@ -80,13 +91,34 @@ def build_memory_card(messages: List[Dict[str, Any]]) -> Dict[str, Any]:
                 elif pending_age > 5:
                     pending_error = None
 
-    return {
+    card = {
         "task": task,
         "files_modified": files[:_MAX_FILES],
         "decisions": decisions[:_MAX_ITEMS],
         "errors_resolved": errors_resolved[:_MAX_ITEMS],
         "messages_summarized": len(messages),
     }
+
+    if llm_cfg is not None:
+        from tokensnap import ollama
+
+        llm = ollama.try_generate_card(messages, llm_cfg)
+        if llm:
+            if llm["task"]:
+                card["task"] = llm["task"]
+            if llm["decisions"]:
+                card["decisions"] = llm["decisions"]
+            if llm["errors_resolved"]:
+                card["errors_resolved"] = llm["errors_resolved"]
+            # Union file lists: regex is reliable, the LLM may add context
+            merged = list(card["files_modified"])
+            for path in llm["files_modified"]:
+                if path not in merged:
+                    merged.append(path)
+            card["files_modified"] = merged[:_MAX_FILES]
+            card["generator"] = "ollama:%s" % llm_cfg.get("ollama_model", "?")
+
+    return card
 
 
 def _find_cut_index(messages: List[Dict[str, Any]], keep_last_n: int) -> int:
@@ -106,6 +138,7 @@ def compress_messages(
     messages: List[Dict[str, Any]],
     keep_last_n: int = 3,
     min_messages: int = 8,
+    llm_cfg: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Optional[str], List[Dict[str, Any]]]:
     """Compress a long history into (memory_card_text, trimmed_messages).
 
@@ -121,7 +154,7 @@ def compress_messages(
         return None, messages
 
     head, tail = messages[:cut], messages[cut:]
-    card = build_memory_card(head)
+    card = build_memory_card(head, llm_cfg=llm_cfg)
     card["original_tokens"] = token_counter.count_message_tokens(head)
 
     injection = (

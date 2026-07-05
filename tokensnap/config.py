@@ -24,6 +24,14 @@ DEFAULTS: Dict[str, Any] = {
     "context_threshold": 0.9,
     # Don't compress conversations shorter than this many messages
     "min_messages_to_compress": 8,
+    # Memory Card generator: "auto" uses a local Ollama model when one is
+    # running and silently falls back to regex; "ollama" is the same but
+    # warns when the server is unreachable; "off" is regex-only.
+    "llm_compressor": "auto",
+    "ollama_url": "http://127.0.0.1:11434",
+    "ollama_model": "llama3.2",
+    # Seconds to wait for the local model before falling back to regex
+    "ollama_timeout": 10.0,
     # Optional stored API key (normally unused: the proxy forwards the
     # key Claude Code already sends in request headers)
     "key": "",
@@ -37,6 +45,12 @@ _TYPES = {
     "aggressive_keep_last_n": int,
     "min_messages_to_compress": int,
     "context_threshold": float,
+    "ollama_timeout": float,
+}
+
+# Keys restricted to a fixed set of values
+_CHOICES = {
+    "llm_compressor": ("auto", "ollama", "off"),
 }
 
 
@@ -68,6 +82,12 @@ def set_value(key: str, value: str) -> Any:
     coerced: Any = value
     if caster is not None:
         coerced = caster(value)
+    if key in _CHOICES:
+        coerced = str(value).lower()
+        if coerced not in _CHOICES[key]:
+            raise ValueError(
+                "%r must be one of: %s" % (key, ", ".join(_CHOICES[key]))
+            )
     cfg = load()
     cfg[key] = coerced
     save(cfg)

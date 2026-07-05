@@ -20,6 +20,7 @@ the ever-growing conversation history that silently eats your usage limits.
 - [Commands](#commands)
 - [Configuration](#configuration)
 - [How Memory Card compression works](#how-memory-card-compression-works)
+- [Smarter Memory Cards with Ollama](#smarter-memory-cards-with-ollama)
 - [Architecture](#architecture)
 - [Safety & scope](#safety--scope)
 - [Development](#development)
@@ -46,6 +47,10 @@ Tokensnap intercepts each API request and applies four optimizations:
    into a compact JSON card (task, files modified, decisions, resolved errors)
    injected as a system note. The last **N** exchanges (default 3) are kept
    verbatim, so Claude never loses the thread of what you're doing *right now*.
+   If a local [Ollama](https://ollama.com) server is running, a local LLM
+   writes the card for you — more accurate than the built-in regex extraction,
+   which remains the automatic fallback. See
+   [Smarter Memory Cards with Ollama](#smarter-memory-cards-with-ollama).
 4. **Budget guard** — token usage is estimated with tiktoken on every request.
    At 90% of the model's context window, Tokensnap automatically gets more
    aggressive: keeps fewer raw messages, drops file contents that appear twice,
@@ -152,6 +157,10 @@ Stored in `~/.tokensnap/config.json`. Everything has a sensible default:
 | `aggressive_keep_last_n` | `2` | `keep_last_n` when near the context window. |
 | `context_threshold` | `0.9` | Fraction of the context window that triggers aggressive mode. |
 | `min_messages_to_compress` | `8` | Histories shorter than this are never compressed. |
+| `llm_compressor` | `auto` | Memory Card generator: `auto` (use Ollama when running, else regex), `ollama` (same, but warn when unreachable), `off` (regex only). |
+| `ollama_url` | `http://127.0.0.1:11434` | Local Ollama server address. |
+| `ollama_model` | `llama3.2` | Model used to write Memory Cards. |
+| `ollama_timeout` | `10.0` | Seconds to wait for the local model before falling back to regex. |
 | `log_level` | `INFO` | Proxy log verbosity. |
 | `key` | *(empty)* | Optional stored API key — normally unnecessary; the proxy forwards the key from request headers. |
 
@@ -175,6 +184,47 @@ The cut point is chosen carefully so the kept history always starts with a
 clean user message — tool_use/tool_result pairs are never split, which would
 otherwise cause API errors.
 
+## Smarter Memory Cards with Ollama
+
+Regex extraction is fast and dependency-free, but it can only recognize
+patterns it was taught. If you have [Ollama](https://ollama.com) installed,
+Tokensnap will ask a **local** LLM to write the Memory Card instead — it
+understands the conversation, so the card captures the task, decisions, and
+error resolutions far more accurately.
+
+This is on by default (`llm_compressor = auto`) and completely automatic:
+
+- On each request Tokensnap checks (at most once a minute) whether an Ollama
+  server answers at `ollama_url`. No server → regex, zero overhead.
+- When available, the truncated history is sent to `ollama_model` with a
+  strict JSON-only prompt at temperature 0. The output is validated, clipped,
+  and **merged over the regex card** — regex-found file paths are always kept,
+  so nothing the old extractor caught is ever lost.
+- Any hiccup — model not pulled, timeout (`ollama_timeout`), malformed
+  output — silently falls back to the regex card. Results (including
+  failures) are cached per conversation, so a slow model never taxes every
+  request.
+- LLM-written cards carry a `"generator": "ollama:<model>"` field so you can
+  tell which path produced them.
+
+Setup is just:
+
+```bash
+ollama pull llama3.2          # once
+tokensnap run claude          # as usual — the proxy detects Ollama itself
+```
+
+The proxy logs which generator is active on startup. Prefer a different
+model, or want it off?
+
+```bash
+tokensnap config set ollama_model qwen2.5:7b
+tokensnap config set llm_compressor off
+```
+
+**Privacy:** the conversation transcript is only ever sent to your local
+Ollama server (localhost by default) — never to any third-party service.
+
 ## Architecture
 
 ```
@@ -182,6 +232,7 @@ Claude Code  --ANTHROPIC_BASE_URL-->  Tokensnap proxy (127.0.0.1:8889)  -->  api
                                             |
                                             |-- cleaner.py       strip ANSI / progress bars / dup lines
                                             |-- compressor.py    build Memory Card, truncate history
+                                            |-- ollama.py        optional local-LLM card writer (regex fallback)
                                             |-- token_counter.py tiktoken-based budget check
                                             '-- stats.py         savings + liveness for status/monitor
 ```
@@ -197,7 +248,8 @@ Anthropic directly.
   request is forwarded byte-for-byte** (including `count_tokens`, models
   listing, etc.).
 - Responses — including SSE streams — are relayed verbatim.
-- Nothing is sent anywhere except the configured upstream. No telemetry.
+- Nothing is sent anywhere except the configured upstream and (only when
+  enabled and running) your local Ollama server. No telemetry.
 - Token counts use tiktoken's `cl100k_base` encoding, a close approximation
   for Claude models; if tiktoken can't load, a chars/4 estimate is used.
 
@@ -208,8 +260,9 @@ pip install -e .[dev]
 pytest
 ```
 
-The test suite (cleaner, compressor, token counter, stats, CLI) runs fully
-offline — no network access or real API key required.
+The test suite (cleaner, compressor, Ollama integration, token counter,
+stats, CLI) runs fully offline — no network access, real API key, or Ollama
+install required (the Ollama tests mock the HTTP layer).
 
 ## Contributing
 

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tokensnap"
-version = "0.1.0"
+version = "0.2.0"
 description = "Intelligent HTTP proxy that cuts Claude Code token usage by 40-70% via context cleaning and history compression."
 readme = "README.md"
 license = { file = "LICENSE" }
