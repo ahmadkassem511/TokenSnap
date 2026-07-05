@@ -93,15 +93,22 @@ def run(
         log_path = config_mod.CONFIG_DIR / "proxy.log"
         config_mod.CONFIG_DIR.mkdir(parents=True, exist_ok=True)
         log_file = open(log_path, "a", encoding="utf-8")
-        creationflags = 0
+        # Fully detach the proxy from this terminal so it survives the
+        # window being closed (otherwise Claude Code is left pointing at a
+        # dead proxy and fails with ConnectionRefused).
+        popen_kwargs = {}
         if os.name == "nt":
-            creationflags = subprocess.CREATE_NEW_PROCESS_GROUP
+            popen_kwargs["creationflags"] = (
+                subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+            )
+        else:
+            popen_kwargs["start_new_session"] = True
         subprocess.Popen(
             [sys.executable, "-m", "tokensnap", "start"],
             stdout=log_file,
             stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL,
-            creationflags=creationflags,
+            **popen_kwargs,
         )
         for _ in range(40):  # up to ~10s
             if stats.proxy_running(cfg["host"], int(cfg["port"])):
@@ -141,8 +148,18 @@ def _build_dashboard(cfg: dict) -> Panel:
     header.add_row(
         "[bold green]● RUNNING[/bold green]" if running else "[bold red]● STOPPED[/bold red]",
         "Requests: [bold]%d[/bold]" % totals["requests"],
-        "Tokens in: [bold]%s[/bold]" % format(before, ","),
-        "Saved: [bold green]%s[/bold green] ([bold]%.1f%%[/bold])" % (format(saved, ","), pct),
+        "Est. saved: [bold green]%s[/bold green] ([bold]%.1f%%[/bold])"
+        % (format(saved, ","), pct),
+    )
+    header.add_row(
+        "[dim]real usage (from Anthropic):[/dim]",
+        "in [bold]%s[/bold]  out [bold]%s[/bold]"
+        % (format(totals["real_input"], ","), format(totals["real_output"], ",")),
+        "cache read [bold]%s[/bold]  write [bold]%s[/bold]"
+        % (
+            format(totals["real_cache_read"], ","),
+            format(totals["real_cache_creation"], ","),
+        ),
     )
 
     table = Table(
@@ -150,28 +167,29 @@ def _build_dashboard(cfg: dict) -> Panel:
     )
     table.add_column("time", width=9)
     table.add_column("model", overflow="fold")
-    table.add_column("before", justify="right")
-    table.add_column("after", justify="right")
+    table.add_column("est.in", justify="right")
     table.add_column("saved", justify="right")
-    table.add_column("%", justify="right")
+    table.add_column("real.in", justify="right")
+    table.add_column("real.out", justify="right")
+    table.add_column("cache", justify="right")
     table.add_column("http", justify="right")
 
     for entry in reversed(data["recent"][-15:]):
-        b, a, s = entry["before"], entry["after"], entry["saved"]
-        row_pct = 100.0 * s / b if b else 0.0
+        b, s = entry["before"], entry["saved"]
         style = "yellow" if entry.get("aggressive") else ""
         table.add_row(
             datetime.fromtimestamp(entry["ts"]).strftime("%H:%M:%S"),
             str(entry["model"]) + (" [AGG]" if entry.get("aggressive") else ""),
             format(b, ","),
-            format(a, ","),
             "[green]%s[/green]" % format(s, ","),
-            "%.0f%%" % row_pct,
+            format(entry.get("real_input", 0), ","),
+            format(entry.get("real_output", 0), ","),
+            format(entry.get("real_cache_read", 0), ","),
             str(entry["status"]),
             style=style,
         )
     if not data["recent"]:
-        table.add_row("-", "[dim]no requests yet[/dim]", "-", "-", "-", "-", "-")
+        table.add_row("-", "[dim]no requests yet[/dim]", "-", "-", "-", "-", "-", "-")
 
     grid = Table.grid()
     grid.add_row(header)
@@ -222,9 +240,12 @@ def status() -> None:
             "Proxy:  %s%s\n"
             "URL:    %s\n"
             "Requests handled: %d\n"
-            "Tokens before optimization: %s\n"
-            "Tokens after optimization:  %s\n"
-            "Tokens saved: [bold green]%s[/bold green] ([bold]%.1f%%[/bold])"
+            "\n[bold]Tokensnap optimization (request body, estimated):[/bold]\n"
+            "  before: %s   after: %s\n"
+            "  saved:  [bold green]%s[/bold green] ([bold]%.1f%%[/bold])\n"
+            "\n[bold]Real usage reported by Anthropic:[/bold]\n"
+            "  input: %s   output: %s\n"
+            "  cache read: %s   cache write: %s"
             % (
                 "[bold green]RUNNING[/bold green]" if running else "[bold red]STOPPED[/bold red]",
                 since,
@@ -234,6 +255,10 @@ def status() -> None:
                 format(totals["tokens_after"], ","),
                 format(saved, ","),
                 pct,
+                format(totals["real_input"], ","),
+                format(totals["real_output"], ","),
+                format(totals["real_cache_read"], ","),
+                format(totals["real_cache_creation"], ","),
             ),
             title="tokensnap status",
             border_style="green" if running else "red",

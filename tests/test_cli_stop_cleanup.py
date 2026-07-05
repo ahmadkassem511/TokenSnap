@@ -16,6 +16,12 @@ from tokensnap import cli, config as config_mod, stats
 runner = CliRunner()
 
 
+def _free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
 @pytest.fixture(autouse=True)
 def isolated_dirs(tmp_path, monkeypatch):
     config_dir = tmp_path / ".tokensnap"
@@ -23,13 +29,12 @@ def isolated_dirs(tmp_path, monkeypatch):
     monkeypatch.setattr(config_mod, "CONFIG_FILE", config_dir / "config.json")
     monkeypatch.setattr(stats, "STATS_DIR", config_dir)
     monkeypatch.setattr(stats, "STATS_FILE", config_dir / "stats.json")
+    # Default to a port nothing listens on, so a real proxy running on the
+    # user's machine (port 8889) is never detected — or killed! — by tests.
+    defaults = dict(config_mod.DEFAULTS)
+    defaults["port"] = _free_port()
+    monkeypatch.setattr(config_mod, "DEFAULTS", defaults)
     yield config_dir
-
-
-def _free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
 
 
 class TestStopCommand:

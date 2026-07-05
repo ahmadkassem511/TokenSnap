@@ -61,6 +61,43 @@ class TestMarkStopped:
         assert data["totals"]["requests"] == 1  # totals are not wiped
 
 
+class TestRealUsage:
+    def test_record_accumulates_real_usage(self):
+        stats.mark_started("127.0.0.1", 8889)
+        stats.record_request(
+            "/v1/messages", "claude-sonnet-5", 100, 60, 200, 0.1,
+            real_input=1000, real_output=200, real_cache_read=8000,
+            real_cache_creation=50,
+        )
+        stats.record_request(
+            "/v1/messages", "claude-sonnet-5", 80, 40, 200, 0.1,
+            real_input=500, real_output=100, real_cache_read=4000,
+            real_cache_creation=0,
+        )
+        totals = stats.load()["totals"]
+        assert totals["real_input"] == 1500
+        assert totals["real_output"] == 300
+        assert totals["real_cache_read"] == 12000
+        assert totals["real_cache_creation"] == 50
+
+        recent = stats.load()["recent"][-1]
+        assert recent["real_input"] == 500
+        assert recent["real_cache_read"] == 4000
+
+    def test_old_stats_file_backfills_new_keys(self):
+        # A stats file written by an older version lacks the real_* totals.
+        stats._save({
+            "proxy": {},
+            "totals": {"requests": 3, "tokens_before": 900, "tokens_after": 300,
+                       "tokens_saved": 600},
+            "recent": [],
+        })
+        totals = stats.load()["totals"]
+        assert totals["requests"] == 3          # preserved
+        assert totals["real_input"] == 0        # backfilled, no KeyError
+        assert totals["real_cache_read"] == 0
+
+
 class TestStopProxy:
     def test_nothing_running_returns_false(self):
         port = _free_port()  # guaranteed nothing listens here

@@ -26,10 +26,17 @@ _MAX_RECENT = 50
 _EMPTY: Dict[str, Any] = {
     "proxy": {},   # {pid, host, port, started_at}
     "totals": {
+        # Tokensnap's own tiktoken estimate of the request body (in/out of
+        # the optimizer) - drives the "saved" figure.
         "requests": 0,
         "tokens_before": 0,
         "tokens_after": 0,
         "tokens_saved": 0,
+        # Real usage as reported by the Anthropic API `usage` field.
+        "real_input": 0,
+        "real_output": 0,
+        "real_cache_read": 0,
+        "real_cache_creation": 0,
     },
     "recent": [],
 }
@@ -40,8 +47,12 @@ def load() -> Dict[str, Any]:
         try:
             with open(STATS_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            merged = dict(_EMPTY)
+            merged = json.loads(json.dumps(_EMPTY))  # deep copy of defaults
             merged.update(data)
+            # Backfill totals keys added in newer versions of Tokensnap.
+            totals = dict(_EMPTY["totals"])
+            totals.update(merged.get("totals") or {})
+            merged["totals"] = totals
             return merged
         except (json.JSONDecodeError, OSError):
             pass
@@ -84,6 +95,10 @@ def record_request(
     status: int,
     elapsed: float,
     aggressive: bool = False,
+    real_input: int = 0,
+    real_output: int = 0,
+    real_cache_read: int = 0,
+    real_cache_creation: int = 0,
 ) -> None:
     data = load()
     saved = max(0, tokens_before - tokens_after)
@@ -92,6 +107,10 @@ def record_request(
     totals["tokens_before"] += tokens_before
     totals["tokens_after"] += tokens_after
     totals["tokens_saved"] += saved
+    totals["real_input"] += real_input
+    totals["real_output"] += real_output
+    totals["real_cache_read"] += real_cache_read
+    totals["real_cache_creation"] += real_cache_creation
     data["recent"].append(
         {
             "ts": time.time(),
@@ -103,6 +122,10 @@ def record_request(
             "status": status,
             "elapsed": round(elapsed, 2),
             "aggressive": aggressive,
+            "real_input": real_input,
+            "real_output": real_output,
+            "real_cache_read": real_cache_read,
+            "real_cache_creation": real_cache_creation,
         }
     )
     data["recent"] = data["recent"][-_MAX_RECENT:]

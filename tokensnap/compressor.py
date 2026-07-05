@@ -121,17 +121,52 @@ def build_memory_card(
     return card
 
 
+# Converted tool outputs at the cut boundary are truncated to this length
+_ORPHAN_RESULT_MAX_CHARS = 2000
+
+
 def _find_cut_index(messages: List[Dict[str, Any]], keep_last_n: int) -> int:
     """Largest safe index to cut the history at, keeping >= keep_last_n
-    exchanges (2*N messages). The first kept message must be a `user`
-    message that is not purely tool_result blocks, so the truncated
-    history never starts mid tool-call or with an assistant turn."""
+    exchanges (2*N messages). The cut must land on a `user` message (the
+    API requires histories to start with one). A tool_result-only user
+    message is acceptable — the caller converts its orphaned tool_results
+    to plain text — which matters for agentic transcripts (Claude Code)
+    where nearly every user message is a tool_result."""
     target = len(messages) - keep_last_n * 2
     for i in range(min(target, len(messages) - 1), 0, -1):
-        msg = messages[i]
-        if msg.get("role") == "user" and not is_tool_result_only(msg):
+        if messages[i].get("role") == "user":
             return i
     return 0
+
+
+def _orphaned_results_to_text(message: Dict[str, Any]) -> Dict[str, Any]:
+    """Rewrite a user message whose tool_result blocks would be orphaned by
+    the cut (their tool_use turn was compressed away) into plain text, so
+    the truncated history is valid for the API."""
+    if not is_tool_result_only(message):
+        return message
+    parts = []
+    for block in message.get("content", []):
+        text = "\n".join(_iter_text_blocks(block.get("content")))
+        if len(text) > _ORPHAN_RESULT_MAX_CHARS:
+            text = text[:_ORPHAN_RESULT_MAX_CHARS] + "\n[tokensnap: tool output truncated]"
+        parts.append(text)
+    joined = "\n".join(p for p in parts if p) or "(no output)"
+    return {
+        "role": "user",
+        "content": "[Output of a tool call from the compressed history]\n" + joined,
+    }
+
+
+def _iter_text_blocks(content: Any) -> List[str]:
+    if isinstance(content, str):
+        return [content] if content else []
+    parts: List[str] = []
+    if isinstance(content, list):
+        for block in content:
+            if isinstance(block, dict) and isinstance(block.get("text"), str):
+                parts.append(block["text"])
+    return parts
 
 
 def compress_messages(
@@ -154,6 +189,7 @@ def compress_messages(
         return None, messages
 
     head, tail = messages[:cut], messages[cut:]
+    tail = [_orphaned_results_to_text(tail[0])] + tail[1:]
     card = build_memory_card(head, llm_cfg=llm_cfg)
     card["original_tokens"] = token_counter.count_message_tokens(head)
 

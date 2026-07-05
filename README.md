@@ -22,6 +22,7 @@ the ever-growing conversation history that silently eats your usage limits.
 - [How Memory Card compression works](#how-memory-card-compression-works)
 - [Smarter Memory Cards with Ollama](#smarter-memory-cards-with-ollama)
 - [Architecture](#architecture)
+- [Estimated vs. real tokens](#estimated-vs-real-tokens)
 - [Safety & scope](#safety--scope)
 - [Development](#development)
 - [Contributing](#contributing)
@@ -106,6 +107,21 @@ tokensnap monitor    # live dashboard in a separate terminal
 tokensnap status     # one-shot summary
 ```
 
+Both views show two sets of numbers:
+
+- **Est. saved** — Tokensnap's own tiktoken estimate of the request body
+  before vs. after optimization. This is the token bloat Tokensnap removed.
+- **Real usage (from Anthropic)** — the actual `input`, `output`,
+  `cache read`, and `cache write` tokens parsed straight from the API
+  responses. These match the numbers Claude Code reports, so you can see
+  true consumption alongside the savings.
+
+> **Tip:** to confirm Claude Code is actually routed through the proxy,
+> keep `tokensnap monitor` open in one terminal and send a prompt in Claude
+> Code — a new request row should appear within a second or two. If nothing
+> shows up, Claude Code isn't using the proxy (see
+> [Estimated vs. real tokens](#estimated-vs-real-tokens)).
+
 ## Commands
 
 | Command | What it does |
@@ -114,8 +130,8 @@ tokensnap status     # one-shot summary
 | `tokensnap run <cmd>` | Ensure the proxy is running, set `ANTHROPIC_BASE_URL`, and launch `<cmd>` (e.g. `claude`) in the same terminal. |
 | `tokensnap stop` | Gracefully stop a proxy that's running in the background (e.g. one started via `tokensnap run`). |
 | `tokensnap cleanup` | Stop the proxy (if running) and delete `~/.tokensnap/` (config, stats, logs) for a clean slate. |
-| `tokensnap monitor` | Live TUI: total savings, per-request table, proxy status. |
-| `tokensnap status` | Is the proxy up? How many tokens saved so far? |
+| `tokensnap monitor` | Live TUI: estimated savings **and real Anthropic usage** (input/output/cache), per-request table, proxy status. |
+| `tokensnap status` | Is the proxy up? Shows estimated savings and real token usage so far. |
 | `tokensnap config show` | Print the effective configuration. |
 | `tokensnap config set <key> <value>` | Change a setting (see below). |
 | `tokensnap config get <key>` | Read one setting. |
@@ -241,7 +257,28 @@ Claude Code  --ANTHROPIC_BASE_URL-->  Tokensnap proxy (127.0.0.1:8889)  -->  api
 Only `POST /v1/messages` and `/v1/complete` request *bodies* are touched, and
 only on the way out. Every response — including SSE streams — is relayed back
 byte-for-byte, so Claude Code behaves exactly as if it were talking to
-Anthropic directly.
+Anthropic directly. As responses stream through, Tokensnap reads (but never
+alters) the `usage` field to report real token consumption.
+
+## Estimated vs. real tokens
+
+Tokensnap reports two different measurements — don't expect them to be equal:
+
+| | What it measures | Where it comes from |
+| --- | --- | --- |
+| **Est. saved** | Input request-body tokens removed by cleaning + compression | tiktoken (`cl100k_base`) estimate, computed locally before forwarding |
+| **Real usage** | Actual input, output, cache-read and cache-write tokens | The `usage` field in Anthropic's responses (same source Claude Code uses) |
+
+Claude Code caches context aggressively, so a turn that Claude reports as
+"40k tokens" is often mostly cheap **cache reads**, not new input. Tokensnap's
+"est. saved" only reflects the request body it actually cleaned and
+compressed, while "real usage" shows the full picture from Anthropic.
+
+**If real usage stays at 0 while you use Claude Code**, the requests aren't
+reaching the proxy. Make sure you launched Claude Code with
+`ANTHROPIC_BASE_URL` pointed at the proxy — the simplest way is
+`tokensnap run claude`. Running plain `claude` in a terminal that doesn't
+have that variable set bypasses Tokensnap entirely.
 
 ## Safety & scope
 

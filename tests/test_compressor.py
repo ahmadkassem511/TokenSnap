@@ -72,9 +72,10 @@ class TestCompressMessages:
         assert payload["messages_summarized"] > 0
         assert payload["original_tokens"] > 0
 
-    def test_never_cuts_into_tool_result(self):
-        # History where the natural cut point lands on a tool_result-only
-        # user message; the cut must back up to a clean user message.
+    def test_cut_on_tool_result_converts_it_to_text(self):
+        # The natural cut lands exactly on a tool_result-only user message;
+        # its orphaned tool_results must be converted to plain text so the
+        # truncated history stays valid for the API.
         msgs = []
         msgs += _exchange("task one", "ok")
         msgs += _exchange("task two", "ok")
@@ -98,21 +99,18 @@ class TestCompressMessages:
         )
         msgs.append({"role": "assistant", "content": "build succeeded"})
 
-        # keep_last_n=1 puts the natural cut exactly on the tool_result
-        # message (index 8); the cut must back up to index 6.
-        _, out = compressor.compress_messages(msgs, keep_last_n=1, min_messages=4)
-        assert len(out) == 4
+        # keep_last_n=1 puts the cut exactly on the tool_result (index 8)
+        card, out = compressor.compress_messages(msgs, keep_last_n=1, min_messages=4)
+        assert card is not None
+        assert len(out) == 2
         assert out[0]["role"] == "user"
         assert not is_tool_result_only(out[0])
-        # tool_use/tool_result pairing preserved inside the kept window
-        for i, m in enumerate(out):
-            if is_tool_result_only(m):
-                prev = out[i - 1]["content"]
-                assert any(b.get("type") == "tool_use" for b in prev)
+        assert "built" in out[0]["content"]  # tool output preserved as text
 
-    def test_no_safe_cut_returns_unchanged(self):
-        # Every user message after index 0 is tool_result-only: no safe cut
-        msgs = [{"role": "user", "content": "start"}]
+    def test_agentic_tool_loop_history_compresses(self):
+        # Claude Code style transcript: one real user prompt, then a long
+        # tool_use/tool_result loop. Compression must still engage.
+        msgs = [{"role": "user", "content": "start the task on main.py"}]
         for i in range(6):
             msgs.append(
                 {
@@ -128,13 +126,20 @@ class TestCompressMessages:
                     "role": "user",
                     "content": [
                         {"type": "tool_result", "tool_use_id": "t%d" % i,
-                         "content": "ok"}
+                         "content": "output %d" % i}
                     ],
                 }
             )
         card, out = compressor.compress_messages(msgs, keep_last_n=2, min_messages=4)
-        assert card is None
-        assert out == msgs
+        assert card is not None
+        assert len(out) < len(msgs)
+        assert out[0]["role"] == "user"
+        assert not is_tool_result_only(out[0])
+        # every remaining tool_result still has its tool_use right before it
+        for i, m in enumerate(out):
+            if is_tool_result_only(m):
+                prev = out[i - 1]["content"]
+                assert any(b.get("type") == "tool_use" for b in prev)
 
     def test_string_and_block_content_both_handled(self):
         msgs = []

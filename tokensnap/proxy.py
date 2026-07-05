@@ -18,6 +18,7 @@ import aiohttp
 from aiohttp import web
 
 from tokensnap import cleaner, compressor, ollama, stats, token_counter
+from tokensnap.usage import UsageAccumulator
 from tokensnap.utils import transform_message_text
 
 log = logging.getLogger("tokensnap.proxy")
@@ -162,6 +163,8 @@ def optimize_body(
         "aggressive": aggressive,
         "model": model,
         "compressed": card is not None,
+        "n_messages": len(body.get("messages") or []),
+        "n_kept": len(messages),
     }
     return new_body, meta
 
@@ -246,8 +249,9 @@ class TokensnapProxy:
                 status=502,
             )
 
+        usage = UsageAccumulator()
         try:
-            response = await self._relay(request, upstream)
+            response = await self._relay(request, upstream, usage)
         finally:
             upstream.release()
 
@@ -256,15 +260,21 @@ class TokensnapProxy:
             saved = meta["before"] - meta["after"]
             pct = 100.0 * saved / meta["before"] if meta["before"] else 0.0
             log.info(
-                "%s %s [%s] %d -> %d tokens (saved %d, %.1f%%)%s  %.2fs",
+                "%s %s [%s] msgs %d->%d, est %d -> %d (saved %d, %.1f%%)%s | "
+                "real in=%d out=%d cache_read=%d  %.2fs",
                 request.method,
                 request.path,
                 meta.get("model") or "?",
+                meta.get("n_messages", 0),
+                meta.get("n_kept", 0),
                 meta["before"],
                 meta["after"],
                 saved,
                 pct,
                 " [AGGRESSIVE]" if meta.get("aggressive") else "",
+                usage.input_tokens,
+                usage.output_tokens,
+                usage.cache_read_tokens,
                 elapsed,
             )
             stats.record_request(
@@ -275,6 +285,10 @@ class TokensnapProxy:
                 upstream.status,
                 elapsed,
                 aggressive=bool(meta.get("aggressive")),
+                real_input=usage.input_tokens,
+                real_output=usage.output_tokens,
+                real_cache_read=usage.cache_read_tokens,
+                real_cache_creation=usage.cache_creation_tokens,
             )
         else:
             log.info(
@@ -284,7 +298,10 @@ class TokensnapProxy:
         return response
 
     async def _relay(
-        self, request: web.Request, upstream: aiohttp.ClientResponse
+        self,
+        request: web.Request,
+        upstream: aiohttp.ClientResponse,
+        usage: UsageAccumulator,
     ) -> web.StreamResponse:
         resp_headers = {
             k: v
@@ -299,11 +316,14 @@ class TokensnapProxy:
             )
             await response.prepare(request)
             async for chunk in upstream.content.iter_any():
+                # Relay bytes verbatim, and tee a copy to the usage parser.
                 await response.write(chunk)
+                usage.feed(chunk)
             await response.write_eof()
             return response
 
         body = await upstream.read()
+        usage.feed_full_body(body)
         return web.Response(status=upstream.status, headers=resp_headers, body=body)
 
 
