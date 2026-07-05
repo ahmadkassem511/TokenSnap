@@ -65,6 +65,7 @@ already sends.
 ### 1. Install
 
 **Windows:** double-click `install.bat`
+
 **Linux / macOS:**
 
 ```bash
