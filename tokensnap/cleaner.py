@@ -51,6 +51,8 @@ def strip_progress_bars(text: str) -> str:
     """
     out_lines = []
     for line in text.split("\n"):
+        # A trailing \r is a CRLF line ending (Windows), not a redraw
+        line = line.rstrip("\r")
         # A redrawn line: keep only what was on screen last
         if "\r" in line:
             line = line.split("\r")[-1]

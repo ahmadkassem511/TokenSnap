@@ -3,7 +3,6 @@
 import os
 import shutil
 import subprocess
-import sys
 import time
 from datetime import datetime
 from typing import List, Optional
@@ -90,31 +89,8 @@ def run(
 
     if not stats.proxy_running(cfg["host"], int(cfg["port"])):
         console.print("[dim]Proxy not running - starting it in the background...[/dim]")
-        log_path = config_mod.CONFIG_DIR / "proxy.log"
-        config_mod.CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-        log_file = open(log_path, "a", encoding="utf-8")
-        # Fully detach the proxy from this terminal so it survives the
-        # window being closed (otherwise Claude Code is left pointing at a
-        # dead proxy and fails with ConnectionRefused).
-        popen_kwargs = {}
-        if os.name == "nt":
-            popen_kwargs["creationflags"] = (
-                subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
-            )
-        else:
-            popen_kwargs["start_new_session"] = True
-        subprocess.Popen(
-            [sys.executable, "-m", "tokensnap", "start"],
-            stdout=log_file,
-            stderr=subprocess.STDOUT,
-            stdin=subprocess.DEVNULL,
-            **popen_kwargs,
-        )
-        for _ in range(40):  # up to ~10s
-            if stats.proxy_running(cfg["host"], int(cfg["port"])):
-                break
-            time.sleep(0.25)
-        else:
+        ok, log_path = stats.start_proxy_detached()
+        if not ok:
             console.print(
                 "[red]Proxy failed to start.[/red] See log: %s" % log_path
             )
@@ -361,6 +337,14 @@ def config_show() -> None:
         table.add_row(k, v)
     console.print(table)
     console.print("[dim]file: %s[/dim]" % config_mod.CONFIG_FILE)
+
+
+@app.command()
+def mcp() -> None:
+    """Run the Tokensnap MCP server on stdio (for Claude Desktop/Code)."""
+    from tokensnap import mcp_server
+
+    mcp_server.serve()
 
 
 @app.command()

@@ -13,6 +13,7 @@ import json
 import os
 import socket
 import subprocess
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -236,6 +237,41 @@ def find_pid_by_port(host: str, port: int) -> Optional[int]:
     except (OSError, subprocess.SubprocessError, ValueError):
         pass
     return None
+
+
+def start_proxy_detached(timeout: float = 10.0) -> Tuple[bool, Path]:
+    """Start `tokensnap start` fully detached from this process, so the
+    proxy survives the launching terminal (or MCP client) exiting.
+
+    Returns (ok, log_path). `ok` is True once the proxy accepts connections.
+    """
+    from tokensnap import config as config_mod
+
+    cfg = config_mod.load()
+    host, port = cfg["host"], int(cfg["port"])
+    log_path = config_mod.CONFIG_DIR / "proxy.log"
+    config_mod.CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    log_file = open(log_path, "a", encoding="utf-8")
+    popen_kwargs: Dict[str, Any] = {}
+    if os.name == "nt":
+        popen_kwargs["creationflags"] = (
+            subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+        )
+    else:
+        popen_kwargs["start_new_session"] = True
+    subprocess.Popen(
+        [sys.executable, "-m", "tokensnap", "start"],
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+        stdin=subprocess.DEVNULL,
+        **popen_kwargs,
+    )
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if proxy_running(host, port):
+            return True, log_path
+        time.sleep(0.25)
+    return False, log_path
 
 
 def stop_proxy(

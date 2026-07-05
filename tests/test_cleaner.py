@@ -47,6 +47,18 @@ class TestStripProgressBars:
         text = "test coverage is 85% overall"
         assert cleaner.strip_progress_bars(text) == text
 
+    def test_crlf_lines_survive(self):
+        # Windows CRLF endings must not be treated as redraw frames
+        text = "line one\r\nline two\r\nline three\r\n"
+        result = cleaner.strip_progress_bars(text)
+        assert result == "line one\nline two\nline three\n"
+
+    def test_crlf_redraw_combination(self):
+        # Redraw frames inside a CRLF-terminated line: keep the last frame
+        text = "step 1\rstep 2 final\r\nnext line\r\n"
+        result = cleaner.strip_progress_bars(text)
+        assert result == "step 2 final\nnext line\n"
+
 
 class TestDedupeConsecutiveLines:
     def test_collapses_long_run(self):

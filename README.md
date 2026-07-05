@@ -142,6 +142,29 @@ start new chats instead of continuing very long ones, avoid re-pasting large
 documents (use Projects), and move heavy coding work to Claude Code routed
 through Tokensnap.
 
+**What Claude Desktop *can* do:** talk to local MCP servers. `tokensnap mcp`
+runs Tokensnap as an MCP stdio server exposing `tokensnap_status`,
+`tokensnap_recent_requests`, `tokensnap_get_config`, `tokensnap_set_config`,
+`tokensnap_start_proxy`, and `tokensnap_stop_proxy` as tools — so you can ask
+Claude Desktop things like "how much have I saved with Tokensnap today?" or
+have it start the proxy for you. Add it to Claude Desktop's MCP config
+(`claude_desktop_config.json`):
+
+```json
+{
+  "mcpServers": {
+    "tokensnap": {
+      "command": "tokensnap",
+      "args": ["mcp"]
+    }
+  }
+}
+```
+
+This manages/inspects Tokensnap from the chat app; it does not route the
+chat app's own conversation through the proxy (see above for why that's not
+possible).
+
 **Routing every Claude Code session automatically** (instead of using
 `tokensnap run` each time) — set the variable persistently:
 
@@ -174,6 +197,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:8889
 | `tokensnap config show` | Print the effective configuration. |
 | `tokensnap config set <key> <value>` | Change a setting (see below). |
 | `tokensnap config get <key>` | Read one setting. |
+| `tokensnap mcp` | Run Tokensnap as an MCP stdio server (status/config/start/stop as tools) — see below. |
 
 ### Stopping and resetting
 
