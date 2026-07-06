@@ -40,15 +40,24 @@ def _messages():
     ]
 
 
-def _mock_server(monkeypatch, response_text, fail_ping=False, fail_post=False):
-    """Patch the HTTP helpers; returns a dict counting calls."""
+def _mock_server(monkeypatch, response_text, fail_ping=False, fail_post=False,
+                  tags=None):
+    """Patch the HTTP helpers; returns a dict counting calls.
+
+    `tags` overrides the /api/tags model list; by default it reports
+    CFG["ollama_model"] ("testmodel") as pulled, so existing behavior
+    (server reachable, model present) is the default unless a test asks
+    for something else.
+    """
     calls = {"ping": 0, "post": 0}
+    if tags is None:
+        tags = {"models": [{"name": "testmodel"}]}
 
     def fake_get(url, timeout):
         calls["ping"] += 1
         if fail_ping:
             raise urllib.error.URLError("connection refused")
-        return 200
+        return tags
 
     def fake_post(url, payload, timeout):
         calls["post"] += 1
@@ -94,6 +103,67 @@ class TestAvailability:
         assert ollama.is_available(CFG)
         assert ollama.is_available({**CFG, "ollama_url": "http://127.0.0.1:9999"})
         assert calls["ping"] == 2
+
+    def test_server_up_but_model_not_pulled(self, monkeypatch):
+        _mock_server(monkeypatch, "{}", tags={"models": [{"name": "other-model"}]})
+        assert not ollama.is_available(CFG)
+
+    def test_model_change_invalidates_cache(self, monkeypatch):
+        # Same server, different configured model: must re-check, not
+        # reuse a cached result for a different model name.
+        calls = _mock_server(monkeypatch, "{}", tags={"models": [{"name": "testmodel"}]})
+        assert ollama.is_available(CFG)
+        assert not ollama.is_available({**CFG, "ollama_model": "other-model"})
+        assert calls["ping"] == 2
+
+    def test_model_tag_suffix_matches_base_name(self, monkeypatch):
+        # Ollama tags list models with a version suffix (e.g. testmodel:latest);
+        # the configured "testmodel" (no suffix) must still match.
+        _mock_server(monkeypatch, "{}", tags={"models": [{"name": "testmodel:latest"}]})
+        assert ollama.is_available(CFG)
+
+    def test_no_model_configured_is_unavailable(self, monkeypatch):
+        _mock_server(monkeypatch, "{}")
+        assert not ollama.is_available({**CFG, "ollama_model": ""})
+
+    def test_missing_model_logs_info_in_auto_mode(self, monkeypatch, caplog):
+        _mock_server(monkeypatch, "{}", tags={"models": []})
+        with caplog.at_level("INFO", logger="tokensnap.ollama"):
+            ollama.is_available({**CFG, "llm_compressor": "auto"})
+        assert any("not pulled" in r.message for r in caplog.records)
+
+    def test_missing_model_warns_in_explicit_ollama_mode(self, monkeypatch, caplog):
+        _mock_server(monkeypatch, "{}", tags={"models": []})
+        with caplog.at_level("INFO", logger="tokensnap.ollama"):
+            ollama.is_available({**CFG, "llm_compressor": "ollama"})
+        warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+        assert any("not pulled" in r.message for r in warnings)
+        assert any("ollama pull" in r.message for r in warnings)
+
+
+class TestStatusReason:
+    def test_off_mode(self):
+        assert ollama.status_reason({"llm_compressor": "off"}) == "regex (llm_compressor=off)"
+
+    def test_available(self, monkeypatch):
+        _mock_server(monkeypatch, "{}")
+        assert ollama.status_reason(CFG) == "ollama:testmodel"
+
+    def test_server_down(self, monkeypatch):
+        _mock_server(monkeypatch, "{}", fail_ping=True)
+        assert "no Ollama server answered" in ollama.status_reason(CFG)
+
+    def test_model_missing(self, monkeypatch):
+        _mock_server(monkeypatch, "{}", tags={"models": [{"name": "other"}]})
+        reason = ollama.status_reason(CFG)
+        assert "not pulled" in reason
+        assert "testmodel" in reason
+
+    def test_reuses_cached_check_no_duplicate_network_call(self, monkeypatch):
+        calls = _mock_server(monkeypatch, "{}")
+        ollama.is_available(CFG)
+        ollama.status_reason(CFG)
+        assert calls["ping"] == 1  # status_reason must not re-probe
 
 
 class TestGenerateCard:

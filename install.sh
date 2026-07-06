@@ -69,7 +69,8 @@ esac
 
 echo ""
 echo "Quickstart:"
+echo "    tokensnap dashboard      # web UI: setup wizard, charts & settings"
 echo "    tokensnap start          # start the proxy"
 echo "    tokensnap run claude     # launch Claude Code through the proxy"
-echo "    tokensnap monitor        # live savings dashboard"
+echo "    tokensnap monitor        # live savings dashboard (terminal)"
 echo ""

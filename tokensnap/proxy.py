@@ -127,7 +127,7 @@ def optimize_body(
     #    local Ollama server is available; regex otherwise)
     card, messages = compressor.compress_messages(
         messages,
-        keep_last_n=int(cfg["keep_last_n"]),
+        keep_last_n=int(cfg["keep_messages"]),
         min_messages=int(cfg["min_messages_to_compress"]),
         llm_cfg=cfg,
     )
@@ -193,18 +193,9 @@ class TokensnapProxy:
             self.cfg["upstream"],
             extra={"markup": True},
         )
-        if ollama.enabled(self.cfg):
-            if await asyncio.to_thread(ollama.is_available, self.cfg):
-                log.info(
-                    "Memory Cards: local LLM via Ollama (%s at %s), regex fallback",
-                    self.cfg.get("ollama_model"),
-                    self.cfg.get("ollama_url"),
-                )
-            else:
-                log.info("Memory Cards: regex (no Ollama server at %s)",
-                         self.cfg.get("ollama_url"))
-        else:
-            log.info("Memory Cards: regex (llm_compressor=off)")
+        status = await asyncio.to_thread(ollama.status_reason, self.cfg)
+        log.info("Memory Cards: %s", status)
+        stats.set_llm_status(status)
 
     async def _on_cleanup(self, app: web.Application) -> None:
         if self.session:

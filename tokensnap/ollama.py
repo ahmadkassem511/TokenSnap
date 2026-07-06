@@ -56,7 +56,9 @@ _SYSTEM_PROMPT = (
 )
 
 _lock = threading.Lock()
-_availability: Dict[str, Any] = {"url": None, "checked_at": 0.0, "available": False}
+_availability: Dict[str, Any] = {
+    "url": None, "checked_at": 0.0, "available": False, "reason": "",
+}
 _card_cache: "OrderedDict[str, Optional[Dict[str, Any]]]" = OrderedDict()
 
 _MISS = object()  # sentinel: hash not in cache (None is a cached failure)
@@ -65,7 +67,9 @@ _MISS = object()  # sentinel: hash not in cache (None is a cached failure)
 def reset_caches() -> None:
     """Clear availability + card caches (used by tests and config reloads)."""
     with _lock:
-        _availability.update({"url": None, "checked_at": 0.0, "available": False})
+        _availability.update(
+            {"url": None, "checked_at": 0.0, "available": False, "reason": ""}
+        )
         _card_cache.clear()
 
 
@@ -74,11 +78,12 @@ def enabled(cfg: Dict[str, Any]) -> bool:
     return str(cfg.get("llm_compressor", "off")).lower() in ("auto", "ollama")
 
 
-def _http_get(url: str, timeout: float) -> int:
-    """GET `url`, return the HTTP status. Raises on connection errors."""
+def _http_get(url: str, timeout: float) -> Dict[str, Any]:
+    """GET `url`, return the decoded JSON body. Raises on connection, HTTP,
+    or decode errors."""
     req = urllib.request.Request(url, method="GET")
     with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return resp.status
+        return json.loads(resp.read().decode("utf-8", "replace"))
 
 
 def _http_post_json(url: str, payload: Dict[str, Any], timeout: float) -> Dict[str, Any]:
@@ -91,40 +96,87 @@ def _http_post_json(url: str, payload: Dict[str, Any], timeout: float) -> Dict[s
         return json.loads(resp.read().decode("utf-8", "replace"))
 
 
-def is_available(cfg: Dict[str, Any]) -> bool:
-    """True when an Ollama server answers at the configured URL.
+def _model_pulled(model: str, tags_body: Any) -> bool:
+    """True when `model` appears in a /api/tags response. Ollama tags often
+    carry a `:tag` suffix (e.g. llama3.2:latest); match with or without it."""
+    if not model:
+        return False
+    models = tags_body.get("models") if isinstance(tags_body, dict) else None
+    if not isinstance(models, list):
+        return False
+    names = [m.get("name") for m in models if isinstance(m, dict)]
+    if model in names:
+        return True
+    base = model.split(":")[0]
+    return any(isinstance(n, str) and n.split(":")[0] == base for n in names)
 
-    Probes at most once per _AVAILABILITY_TTL seconds; both up and down
-    results are cached so an absent Ollama costs (almost) nothing.
+
+def is_available(cfg: Dict[str, Any]) -> bool:
+    """True when an Ollama server is reachable AND the configured
+    `ollama_model` is pulled.
+
+    Probes at most once per _AVAILABILITY_TTL seconds; both the "server
+    down" and "model missing" outcomes are cached (with a reason string),
+    so a broken setup doesn't add latency or repeat warnings on every
+    request. Use `status_reason()` for a human-readable explanation.
     """
     if not enabled(cfg):
         return False
     url = str(cfg.get("ollama_url", "")).rstrip("/")
+    model = str(cfg.get("ollama_model", "")).strip()
     if not url:
         return False
 
+    cache_key = url + "\x00" + model
     now = time.monotonic()
     with _lock:
         if (
-            _availability["url"] == url
+            _availability["url"] == cache_key
             and now - _availability["checked_at"] < _AVAILABILITY_TTL
         ):
             return bool(_availability["available"])
 
+    ok = False
+    reason = ""
     try:
-        ok = 200 <= _http_get(url + "/api/tags", _PING_TIMEOUT) < 300
+        tags = _http_get(url + "/api/tags", _PING_TIMEOUT)
     except (urllib.error.URLError, OSError, ValueError):
-        ok = False
+        reason = "no Ollama server answered at %s" % url
+    else:
+        if not model:
+            reason = "no ollama_model is configured"
+        elif _model_pulled(model, tags):
+            ok = True
+        else:
+            reason = (
+                "Ollama is running at %s but model %r is not pulled. "
+                "Run `ollama pull %s`, or switch to regex-only cards with "
+                '`tokensnap config set ollama_model ""`.' % (url, model, model)
+            )
 
     with _lock:
-        _availability.update({"url": url, "checked_at": now, "available": ok})
-    if not ok and str(cfg.get("llm_compressor", "")).lower() == "ollama":
-        log.warning(
-            "llm_compressor is set to 'ollama' but no server answered at %s; "
-            "falling back to regex Memory Cards",
-            url,
+        _availability.update(
+            {"url": cache_key, "checked_at": now, "available": ok, "reason": reason}
         )
+
+    if not ok and reason:
+        # "ollama" mode is an explicit user choice, so a missing server/model
+        # is worth a louder warning than the silent-by-design "auto" mode.
+        level = log.warning if str(cfg.get("llm_compressor", "")).lower() == "ollama" else log.info
+        level("Memory Cards: %s; using regex fallback.", reason)
     return ok
+
+
+def status_reason(cfg: Dict[str, Any]) -> str:
+    """One-line human status of the Memory Card generator, for the proxy
+    startup log and the stats file (surfaced in `tokensnap status`/`monitor`)."""
+    if not enabled(cfg):
+        return "regex (llm_compressor=off)"
+    if is_available(cfg):
+        return "ollama:%s" % cfg.get("ollama_model")
+    with _lock:
+        reason = _availability.get("reason") or "unavailable"
+    return "regex (%s)" % reason
 
 
 def build_transcript(messages: List[Dict[str, Any]]) -> str:

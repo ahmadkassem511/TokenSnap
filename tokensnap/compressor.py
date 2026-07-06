@@ -171,7 +171,7 @@ def _iter_text_blocks(content: Any) -> List[str]:
 
 def compress_messages(
     messages: List[Dict[str, Any]],
-    keep_last_n: int = 3,
+    keep_last_n: int = 10,
     min_messages: int = 8,
     llm_cfg: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Optional[str], List[Dict[str, Any]]]:
@@ -179,7 +179,9 @@ def compress_messages(
 
     Returns (None, messages) unchanged when the history is short or no
     safe cut point exists. The memory card text is meant to be appended
-    to the request's `system` prompt by the caller.
+    to the request's `system` prompt by the caller. `keep_last_n` is the
+    number of recent exchanges to keep verbatim - the proxy sources this
+    from the `keep_messages` config value (see `tokensnap preset`).
     """
     if not messages or len(messages) <= min_messages:
         return None, messages

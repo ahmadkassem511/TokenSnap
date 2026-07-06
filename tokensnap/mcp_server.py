@@ -57,7 +57,7 @@ TOOLS: List[Dict[str, Any]] = [
     ),
     _tool(
         "tokensnap_set_config",
-        "Set one Tokensnap config key, e.g. keep_last_n=4. "
+        "Set one Tokensnap config key, e.g. keep_messages=15. "
         "Takes effect on the next proxy start.",
         {
             "key": {"type": "string", "description": "Config key"},
@@ -89,6 +89,8 @@ def _status_payload() -> Dict[str, Any]:
         "proxy_running": running,
         "proxy_url": "http://%s:%s" % (cfg["host"], cfg["port"]),
         "requests_handled": totals["requests"],
+        "keep_messages": int(cfg["keep_messages"]),
+        "memory_card_generator": data.get("llm_status") or "not started yet",
         "estimated_tokens_before": before,
         "estimated_tokens_after": totals["tokens_after"],
         "estimated_tokens_saved": saved,

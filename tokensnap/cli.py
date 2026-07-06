@@ -137,6 +137,11 @@ def _build_dashboard(cfg: dict) -> Panel:
             format(totals["real_cache_creation"], ","),
         ),
     )
+    header.add_row(
+        "keep_messages: [bold]%d[/bold]" % int(cfg["keep_messages"]),
+        "Memory Cards: %s" % (data.get("llm_status") or "not started yet"),
+        "",
+    )
 
     table = Table(
         show_header=True, header_style="bold cyan", expand=True, box=None
@@ -180,6 +185,46 @@ def _build_dashboard(cfg: dict) -> Panel:
 
 
 @app.command()
+def dashboard(
+    port: int = typer.Option(9876, help="Port for the web dashboard (default 9876)"),
+    host: str = typer.Option("127.0.0.1", help="Host to bind (default 127.0.0.1)"),
+    no_browser: bool = typer.Option(
+        False, "--no-browser", help="Don't open a browser automatically"
+    ),
+) -> None:
+    """Launch the web dashboard: live stats, charts, setup wizard, and settings.
+
+    Runs independently of the proxy (which is a separate background process),
+    so opening or closing the dashboard never affects request handling. This is
+    a richer alternative to the `tokensnap monitor` TUI; both can run at once.
+    """
+    from tokensnap import webui
+
+    url = "http://%s:%d" % ("127.0.0.1" if host in ("0.0.0.0", "::") else host, port)
+    console.print(
+        Panel.fit(
+            "[bold]Tokensnap dashboard[/bold]\n\n"
+            "Open in your browser:\n  [cyan]%s[/cyan]\n\n"
+            "Live stats, savings charts, the first-run setup wizard, and settings.\n"
+            "[dim]Ctrl+C to stop the dashboard (the proxy keeps running).[/dim]"
+            % url,
+            title="tokensnap dashboard",
+            border_style="green",
+        )
+    )
+    try:
+        webui.serve(host=host, port=port, open_browser=not no_browser)
+    except KeyboardInterrupt:
+        pass
+    except OSError as exc:
+        console.print(
+            "[red]Couldn't start the dashboard on %s[/red] (%s). "
+            "Is it already running, or the port in use?" % (url, exc)
+        )
+        raise typer.Exit(code=1)
+
+
+@app.command()
 def monitor() -> None:
     """Live TUI dashboard: savings, budget, and recent requests."""
     cfg = config_mod.load()
@@ -210,12 +255,15 @@ def status() -> None:
         since = datetime.fromtimestamp(proxy_info["started_at"]).strftime(
             " (since %Y-%m-%d %H:%M:%S)"
         )
+    llm_status = data.get("llm_status") or "not started yet"
 
     console.print(
         Panel.fit(
             "Proxy:  %s%s\n"
             "URL:    %s\n"
             "Requests handled: %d\n"
+            "Compression: keep_messages=%d (last N exchanges kept verbatim)\n"
+            "Memory Cards: %s\n"
             "\n[bold]Tokensnap optimization (request body, estimated):[/bold]\n"
             "  before: %s   after: %s\n"
             "  saved:  [bold green]%s[/bold green] ([bold]%.1f%%[/bold])\n"
@@ -227,6 +275,8 @@ def status() -> None:
                 since,
                 _base_url(cfg),
                 totals["requests"],
+                int(cfg["keep_messages"]),
+                llm_status,
                 format(before, ","),
                 format(totals["tokens_after"], ","),
                 format(saved, ","),
@@ -301,7 +351,8 @@ def cleanup(
 
 @config_app.command("set")
 def config_set(key: str, value: str) -> None:
-    """Set a config value, e.g. `tokensnap config set keep_last_n 4`."""
+    """Set a config value, e.g. `tokensnap config set keep_messages 15`."""
+    key = config_mod.resolve_key(key)
     try:
         coerced = config_mod.set_value(key, value)
     except KeyError as exc:
@@ -317,6 +368,7 @@ def config_set(key: str, value: str) -> None:
 @config_app.command("get")
 def config_get(key: str) -> None:
     """Print one config value."""
+    key = config_mod.resolve_key(key)
     cfg = config_mod.load()
     if key not in cfg:
         console.print("[red]Unknown key %r[/red]" % key)
@@ -337,6 +389,47 @@ def config_show() -> None:
         table.add_row(k, v)
     console.print(table)
     console.print("[dim]file: %s[/dim]" % config_mod.CONFIG_FILE)
+
+
+_PRESETS = {
+    "simple": {"keep_messages": 5},
+    "balanced": {"keep_messages": 10},
+    "complex": {"keep_messages": 20},
+    "maximum": {"keep_messages": 999},
+}
+_PRESET_HELP = {
+    "simple": "quick scripts, single-file tasks",
+    "balanced": "the default - suitable for most projects",
+    "complex": "large multi-file projects that need more context",
+    "maximum": "effectively disables compression (noise cleaning only)",
+}
+
+
+@app.command()
+def preset(
+    name: str = typer.Argument(
+        ..., help="simple | balanced | complex | maximum"
+    ),
+) -> None:
+    """Apply a recommended keep_messages value for your project type.
+
+    More context (higher keep_messages) means Claude keeps more of the
+    real conversation and fewer tokens are saved; less context means more
+    savings but a higher risk Claude loses track of complex work.
+    """
+    name = name.lower()
+    if name not in _PRESETS:
+        console.print(
+            "[red]Unknown preset %r.[/red] Choose from: %s"
+            % (name, ", ".join(_PRESETS))
+        )
+        raise typer.Exit(code=1)
+    for key, value in _PRESETS[name].items():
+        config_mod.set_value(key, str(value))
+    console.print(
+        "[green]Applied preset[/green] %r (%s): keep_messages=%d"
+        % (name, _PRESET_HELP[name], _PRESETS[name]["keep_messages"])
+    )
 
 
 @app.command()

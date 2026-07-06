@@ -94,6 +94,6 @@ def context_window_for(model: Optional[str]) -> int:
     return DEFAULT_CONTEXT_WINDOW
 
 
-def near_limit(tokens: int, model: Optional[str], threshold: float = 0.9) -> bool:
+def near_limit(tokens: int, model: Optional[str], threshold: float = 0.95) -> bool:
     """True when `tokens` is at or past `threshold` of the model's window."""
     return tokens >= context_window_for(model) * threshold

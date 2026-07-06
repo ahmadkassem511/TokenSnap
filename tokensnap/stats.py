@@ -26,6 +26,9 @@ _MAX_RECENT = 50
 
 _EMPTY: Dict[str, Any] = {
     "proxy": {},   # {pid, host, port, started_at}
+    # One-line Memory Card generator status (e.g. "ollama:llama3.2" or
+    # "regex (model 'llama3.2' not pulled)"), refreshed on each proxy start.
+    "llm_status": "",
     "totals": {
         # Tokensnap's own tiktoken estimate of the request body (in/out of
         # the optimizer) - drives the "saved" figure.
@@ -83,8 +86,16 @@ def mark_started(host: str, port: int) -> None:
         "port": port,
         "started_at": time.time(),
     }
+    data["llm_status"] = ""
     data["totals"] = dict(_EMPTY["totals"])
     data["recent"] = []
+    _save(data)
+
+
+def set_llm_status(status: str) -> None:
+    """Record the current Memory Card generator status for status/monitor."""
+    data = load()
+    data["llm_status"] = status
     _save(data)
 
 
@@ -112,9 +123,10 @@ def record_request(
     totals["real_output"] += real_output
     totals["real_cache_read"] += real_cache_read
     totals["real_cache_creation"] += real_cache_creation
+    now = time.time()
     data["recent"].append(
         {
-            "ts": time.time(),
+            "ts": now,
             "path": path,
             "model": model or "?",
             "before": tokens_before,
@@ -131,6 +143,26 @@ def record_request(
     )
     data["recent"] = data["recent"][-_MAX_RECENT:]
     _save(data)
+
+    # Persist to the history DB for the web dashboard's charts. Imported lazily
+    # and wrapped so a database problem can never break the proxy's hot path -
+    # the stats.json file above is the source of truth for live status either way.
+    try:
+        from tokensnap import history
+
+        history.log_request(
+            model=model,
+            est_tokens_in=tokens_before,
+            real_tokens_in=real_input,
+            real_tokens_out=real_output,
+            cache_read=real_cache_read,
+            cache_write=real_cache_creation,
+            saved=saved,
+            http_status=status,
+            ts=now,
+        )
+    except Exception:  # noqa: BLE001 - history is strictly best-effort
+        pass
 
 
 def proxy_running(host: Optional[str] = None, port: Optional[int] = None) -> bool:

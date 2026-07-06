@@ -99,9 +99,16 @@ class TestStatusAndConfigTools:
         assert "********" in text
 
     def test_set_config_updates_value(self):
-        resp = _call("tokensnap_set_config", {"key": "keep_last_n", "value": "5"})
+        resp = _call("tokensnap_set_config", {"key": "keep_messages", "value": "5"})
         assert resp["result"]["isError"] is False
-        assert config_mod.load()["keep_last_n"] == 5
+        assert config_mod.load()["keep_messages"] == 5
+
+    def test_set_config_resolves_legacy_key_alias(self):
+        # keep_last_n is the pre-0.3 name for keep_messages; MCP callers
+        # using the old name must still work.
+        resp = _call("tokensnap_set_config", {"key": "keep_last_n", "value": "7"})
+        assert resp["result"]["isError"] is False
+        assert config_mod.load()["keep_messages"] == 7
 
     def test_set_config_refuses_key_field(self):
         resp = _call("tokensnap_set_config", {"key": "key", "value": "sk-ant-x"})

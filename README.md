@@ -20,6 +20,7 @@ the ever-growing conversation history that silently eats your usage limits.
 - [What works with Tokensnap (and what doesn't)](#what-works-with-tokensnap-and-what-doesnt)
 - [Commands](#commands)
 - [Configuration](#configuration)
+- [Tuning for your project type](#tuning-for-your-project-type)
 - [How Memory Card compression works](#how-memory-card-compression-works)
 - [Smarter Memory Cards with Ollama](#smarter-memory-cards-with-ollama)
 - [Architecture](#architecture)
@@ -47,14 +48,16 @@ Tokensnap intercepts each API request and applies four optimizations:
    warnings) collapse into one line plus a repeat count.
 3. **Memory Card compression** — long conversation histories are summarized
    into a compact JSON card (task, files modified, decisions, resolved errors)
-   injected as a system note. The last **N** exchanges (default 3) are kept
-   verbatim, so Claude never loses the thread of what you're doing *right now*.
+   injected as a system note. The last **N** exchanges (`keep_messages`,
+   default 10) are kept verbatim, so Claude never loses the thread of what
+   you're doing *right now* — tune this per project with `tokensnap preset`,
+   see [Tuning for your project type](#tuning-for-your-project-type).
    If a local [Ollama](https://ollama.com) server is running, a local LLM
    writes the card for you — more accurate than the built-in regex extraction,
    which remains the automatic fallback. See
    [Smarter Memory Cards with Ollama](#smarter-memory-cards-with-ollama).
 4. **Budget guard** — token usage is estimated with tiktoken on every request.
-   At 90% of the model's context window, Tokensnap automatically gets more
+   At 95% of the model's context window, Tokensnap automatically gets more
    aggressive: keeps fewer raw messages, drops file contents that appear twice,
    and trims the system prompt.
 
@@ -104,9 +107,17 @@ claude
 ### 3. Watch the savings
 
 ```bash
-tokensnap monitor    # live dashboard in a separate terminal
+tokensnap dashboard  # web UI (http://127.0.0.1:9876): charts, history & settings
+tokensnap monitor    # live TUI dashboard in a separate terminal
 tokensnap status     # one-shot summary
 ```
+
+The **web dashboard** (`tokensnap dashboard`) is the richest view: a first-run
+setup wizard (hardware detection + one-click Ollama model pull), historical
+savings charts (7 days / 8 weeks / 6 months), a live log, and a settings page.
+It runs independently of the proxy, so opening or closing it never interrupts
+request handling — you can leave the proxy running and open the dashboard
+whenever you like.
 
 Both views show two sets of numbers:
 
@@ -192,11 +203,13 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:8889
 | `tokensnap run <cmd>` | Ensure the proxy is running, set `ANTHROPIC_BASE_URL`, and launch `<cmd>` (e.g. `claude`) in the same terminal. |
 | `tokensnap stop` | Gracefully stop a proxy that's running in the background (e.g. one started via `tokensnap run`). |
 | `tokensnap cleanup` | Stop the proxy (if running) and delete `~/.tokensnap/` (config, stats, logs) for a clean slate. |
+| `tokensnap dashboard` | Web UI at `http://127.0.0.1:9876`: setup wizard, savings charts, live log, and settings. Runs independently of the proxy. `--port`, `--host`, `--no-browser`. |
 | `tokensnap monitor` | Live TUI: estimated savings **and real Anthropic usage** (input/output/cache), per-request table, proxy status. |
 | `tokensnap status` | Is the proxy up? Shows estimated savings and real token usage so far. |
 | `tokensnap config show` | Print the effective configuration. |
 | `tokensnap config set <key> <value>` | Change a setting (see below). |
 | `tokensnap config get <key>` | Read one setting. |
+| `tokensnap preset <name>` | Apply a recommended `keep_messages` value for your project type: `simple`, `balanced`, `complex`, `maximum` — see [Tuning for your project type](#tuning-for-your-project-type). |
 | `tokensnap mcp` | Run Tokensnap as an MCP stdio server (status/config/start/stop as tools) — see below. |
 
 ### Stopping and resetting
@@ -233,9 +246,9 @@ Stored in `~/.tokensnap/config.json`. Everything has a sensible default:
 | --- | --- | --- |
 | `host` / `port` | `127.0.0.1` / `8889` | Where the proxy listens. |
 | `upstream` | `https://api.anthropic.com` | The real API endpoint. |
-| `keep_last_n` | `3` | Exchanges kept verbatim when history is compressed. |
-| `aggressive_keep_last_n` | `2` | `keep_last_n` when near the context window. |
-| `context_threshold` | `0.9` | Fraction of the context window that triggers aggressive mode. |
+| `keep_messages` | `10` | Exchanges kept verbatim when history is compressed. Higher = more context, fewer tokens saved. See [Tuning for your project type](#tuning-for-your-project-type). (Pre-0.3 name: `keep_last_n`, still accepted.) |
+| `aggressive_keep_last_n` | `2` | `keep_messages` drops to this when near the context window. |
+| `context_threshold` | `0.95` | Fraction of the context window that triggers aggressive mode. |
 | `min_messages_to_compress` | `8` | Histories shorter than this are never compressed. |
 | `llm_compressor` | `auto` | Memory Card generator: `auto` (use Ollama when running, else regex), `ollama` (same, but warn when unreachable), `off` (regex only). |
 | `ollama_url` | `http://127.0.0.1:11434` | Local Ollama server address. |
@@ -247,14 +260,44 @@ Stored in `~/.tokensnap/config.json`. Everything has a sensible default:
 Example — keep more raw history:
 
 ```bash
-tokensnap config set keep_last_n 5
+tokensnap config set keep_messages 15
 ```
+
+## Tuning for your project type
+
+`keep_messages` is a trade-off dial, not a "more is always better" setting:
+
+- **Higher `keep_messages`** → Claude keeps more of the actual recent
+  conversation in full, so it's less likely to lose track of what it's
+  doing on a complex, multi-file task — at the cost of fewer tokens saved,
+  since more raw history is sent every request.
+- **Lower `keep_messages`** → more aggressive compression, bigger token
+  savings — but more of the conversation is replaced by the summarized
+  Memory Card, so subtle details (exact variable names, code not captured
+  by the regex/LLM summary, etc.) are more likely to get lost on long,
+  intricate tasks.
+
+The right value depends on what you're working on, so pick a preset instead
+of guessing:
+
+```bash
+tokensnap preset simple     # keep_messages=5   - quick scripts, single-file tasks
+tokensnap preset balanced   # keep_messages=10  - the default, suitable for most projects
+tokensnap preset complex    # keep_messages=20  - large multi-file projects (e.g. DevReady-style codebases)
+tokensnap preset maximum    # keep_messages=999 - effectively disables compression (noise cleaning only)
+```
+
+If Claude starts "forgetting" earlier decisions or files it already touched
+on a big project, that's a sign `keep_messages` is too low for that
+project — run `tokensnap preset complex` (or set a custom value) before
+starting your next session. You can always fine-tune further with
+`tokensnap config set keep_messages <N>`.
 
 ## How Memory Card compression works
 
 When a request's `messages` array exceeds `min_messages_to_compress`, Tokensnap:
 
-1. Splits the history: everything except the last `keep_last_n` exchanges.
+1. Splits the history: everything except the last `keep_messages` exchanges.
 2. Runs rule-based extraction over the old part: file paths touched, lines
    like `Decision: …` / `we will use …`, and error→resolution pairs.
 3. Builds a compact JSON card and appends it to the request's system prompt.
@@ -275,17 +318,30 @@ error resolutions far more accurately.
 This is on by default (`llm_compressor = auto`) and completely automatic:
 
 - On each request Tokensnap checks (at most once a minute) whether an Ollama
-  server answers at `ollama_url`. No server → regex, zero overhead.
+  server answers at `ollama_url` **and** that `ollama_model` is actually
+  pulled. Either check failing → regex, zero overhead.
 - When available, the truncated history is sent to `ollama_model` with a
   strict JSON-only prompt at temperature 0. The output is validated, clipped,
   and **merged over the regex card** — regex-found file paths are always kept,
   so nothing the old extractor caught is ever lost.
 - Any hiccup — model not pulled, timeout (`ollama_timeout`), malformed
-  output — silently falls back to the regex card. Results (including
-  failures) are cached per conversation, so a slow model never taxes every
-  request.
+  output — falls back to the regex card. Results (including failures) are
+  cached per conversation, so a slow model never taxes every request.
 - LLM-written cards carry a `"generator": "ollama:<model>"` field so you can
   tell which path produced them.
+
+**If the configured model isn't pulled**, Tokensnap doesn't just silently
+degrade — it logs a clear message telling you what to do:
+
+```
+Memory Cards: regex (Ollama is running at http://127.0.0.1:11434 but model
+'qwen2.5:7b' is not pulled. Run `ollama pull qwen2.5:7b`, or switch to
+regex-only cards with `tokensnap config set ollama_model ""`.)
+```
+
+This check runs on proxy startup (and is re-checked at most once a minute
+while running), and the current generator status is also visible in
+`tokensnap status` and `tokensnap monitor` (as "Memory Cards: ...").
 
 Setup is just:
 
