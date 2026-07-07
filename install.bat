@@ -113,6 +113,19 @@ if exist "%DESKTOPDIR%\TokenSnap Dashboard.lnk" (
 )
 
 echo.
+where claude >nul 2>nul
+if errorlevel 1 (
+    echo [NOTE] The 'claude' command isn't on your PATH.
+    echo        'tokensnap run claude' will still find it in npm's global folder
+    echo        or via npx, so you may not need to do anything. If Claude Code
+    echo        isn't installed yet, install it with:
+    echo            npm install -g @anthropic-ai/claude-code
+    echo        or download it from https://claude.ai/download
+) else (
+    echo Found Claude Code on PATH.
+)
+
+echo.
 echo Quickstart:
 echo   tokensnap dashboard        (web UI: setup wizard, charts ^& settings)
 echo   tokensnap start            (start the proxy)

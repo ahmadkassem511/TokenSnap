@@ -120,6 +120,18 @@ SHORTCUT_EOF
 fi
 
 echo ""
+if command -v claude >/dev/null 2>&1; then
+    echo "Found Claude Code on PATH."
+else
+    echo "[NOTE] The 'claude' command isn't on your PATH."
+    echo "       'tokensnap run claude' will still find it in npm's global bin"
+    echo "       or via npx, so you may not need to do anything. If Claude Code"
+    echo "       isn't installed yet, install it with:"
+    echo "           npm install -g @anthropic-ai/claude-code"
+    echo "       or download it from https://claude.ai/download"
+fi
+
+echo ""
 echo "Quickstart:"
 echo "  tokensnap dashboard        # web UI: setup wizard, charts & settings"
 echo "  tokensnap start            # start the proxy"

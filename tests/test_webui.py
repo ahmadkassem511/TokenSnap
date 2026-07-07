@@ -242,7 +242,8 @@ class TestApplySettingsFallbackModels:
 
 class TestLaunchClaudeTerminal:
     def test_claude_not_installed_returns_install_hint(self, monkeypatch):
-        monkeypatch.setattr(webui.shutil, "which", lambda name: None)
+        # Claude can't be resolved any way (not on PATH, no npm global, no npx).
+        monkeypatch.setattr(webui, "resolve_claude_command", lambda cmd: None)
         ok, message = webui._launch_claude_terminal()
         assert ok is False
         assert "claude.ai/download" in message or "npm install" in message
@@ -250,11 +251,12 @@ class TestLaunchClaudeTerminal:
     def test_starts_proxy_if_not_running(self, tmp_path, monkeypatch):
         monkeypatch.setattr(webui.config_mod, "CONFIG_DIR", tmp_path)
         monkeypatch.setattr(webui.config_mod, "CONFIG_FILE", tmp_path / "config.json")
-        # "claude" must resolve for the install check to pass; on non-Windows
-        # CI runners (no real terminal emulator installed), the Linux
-        # terminal-detection loop also needs at least one hit so the test
-        # exercises success regardless of which platform branch runs.
-        known_terminals = {"claude", "x-terminal-emulator", "gnome-terminal", "konsole", "xterm"}
+        # claude resolves (installed, possibly off-PATH -> found via npm/npx).
+        monkeypatch.setattr(webui, "resolve_claude_command", lambda cmd: list(cmd))
+        # On non-Windows CI runners (no real terminal emulator installed), the
+        # Linux terminal-detection loop still needs at least one hit so the
+        # test exercises success regardless of which platform branch runs.
+        known_terminals = {"x-terminal-emulator", "gnome-terminal", "konsole", "xterm"}
         monkeypatch.setattr(
             webui.shutil, "which",
             lambda name: ("/usr/bin/" + name) if name in known_terminals else None,
@@ -276,7 +278,7 @@ class TestLaunchClaudeTerminal:
     def test_proxy_start_failure_is_reported(self, tmp_path, monkeypatch):
         monkeypatch.setattr(webui.config_mod, "CONFIG_DIR", tmp_path)
         monkeypatch.setattr(webui.config_mod, "CONFIG_FILE", tmp_path / "config.json")
-        monkeypatch.setattr(webui.shutil, "which", lambda name: "/usr/bin/claude" if name == "claude" else None)
+        monkeypatch.setattr(webui, "resolve_claude_command", lambda cmd: list(cmd))
         monkeypatch.setattr(webui.stats, "proxy_running", lambda *a, **k: False)
         monkeypatch.setattr(
             webui.stats, "start_proxy_detached", lambda: (False, tmp_path / "proxy.log")

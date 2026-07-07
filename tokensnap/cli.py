@@ -15,6 +15,7 @@ from rich.table import Table
 
 from tokensnap import __version__, stats
 from tokensnap import config as config_mod
+from tokensnap.utils import CLAUDE_INSTALL_HINT, resolve_claude_command
 
 app = typer.Typer(
     name="tokensnap",
@@ -87,6 +88,14 @@ def run(
     cfg = config_mod.load()
     base_url = _base_url(cfg)
 
+    # Resolve `claude` even when it's installed but not on PATH (a common npm
+    # global-install situation, especially on Windows). Non-claude commands
+    # pass through untouched, so `tokensnap run <anything>` still works.
+    resolved = resolve_claude_command(list(command))
+    if resolved is None:
+        console.print("[red]%s[/red]" % CLAUDE_INSTALL_HINT)
+        raise typer.Exit(code=1)
+
     if not stats.proxy_running(cfg["host"], int(cfg["port"])):
         console.print("[dim]Proxy not running - starting it in the background...[/dim]")
         ok, log_path = stats.start_proxy_detached()
@@ -101,13 +110,13 @@ def run(
     env["ANTHROPIC_BASE_URL"] = base_url
     console.print(
         "[dim]ANTHROPIC_BASE_URL=%s -> launching:[/dim] [bold]%s[/bold]"
-        % (base_url, " ".join(command))
+        % (base_url, " ".join(resolved))
     )
     # shell=True on Windows so .cmd/.bat shims (like `claude`) resolve
     if os.name == "nt":
-        code = subprocess.call(subprocess.list2cmdline(command), env=env, shell=True)
+        code = subprocess.call(subprocess.list2cmdline(resolved), env=env, shell=True)
     else:
-        code = subprocess.call(command, env=env)
+        code = subprocess.call(resolved, env=env)
     raise typer.Exit(code=code)
 
 

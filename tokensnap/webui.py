@@ -34,6 +34,7 @@ from aiohttp import web
 
 from tokensnap import __version__, context_store, history, openrouter, stats
 from tokensnap import config as config_mod
+from tokensnap.utils import resolve_claude_command
 
 DEFAULT_PORT = 9876
 
@@ -289,7 +290,10 @@ def _launch_claude_terminal() -> "tuple[bool, str]":
     not the ``tokensnap`` console script is on PATH. Returns (ok, message);
     `message` is shown as both a toast and a persistent on-page result.
     """
-    if not shutil.which("claude"):
+    # Resolve claude past PATH (npm global bin / npx) so we don't wrongly
+    # report it missing when it's installed but not on PATH. The actual launch
+    # is delegated to `tokensnap run claude`, which resolves it again itself.
+    if resolve_claude_command(["claude"]) is None:
         return False, _CLAUDE_INSTALL_HINT
 
     if not stats.proxy_running(*_proxy_host_port()):
