@@ -221,7 +221,11 @@ def resolve_claude_command(command: List[str]) -> Optional[List[str]]:
     """
     if not command:
         return command
-    base = os.path.basename(command[0]).lower()
+    # os.path.basename only splits on the host OS's own separator (posixpath
+    # ignores backslashes), so normalize both separators explicitly rather
+    # than rely on basename to recognize a Windows-style path when this runs
+    # on Linux/macOS (or vice versa).
+    base = command[0].replace("\\", "/").rsplit("/", 1)[-1].lower()
     if base not in ("claude", "claude.exe", "claude.cmd"):
         return command
 
