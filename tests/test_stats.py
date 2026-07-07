@@ -61,6 +61,44 @@ class TestMarkStopped:
         assert data["totals"]["requests"] == 1  # totals are not wiped
 
 
+class TestContextEngineTotals:
+    @pytest.fixture(autouse=True)
+    def isolated_history(self, tmp_path, monkeypatch):
+        # record_request also best-effort-logs to history.db; keep it off the
+        # real one so this test stays fully isolated.
+        from tokensnap import history
+
+        monkeypatch.setattr(history, "DB_FILE", tmp_path / "history.db")
+        yield
+
+    def test_context_totals_only_move_on_context_requests(self):
+        stats.mark_started("127.0.0.1", 8889)
+        # A classic request must not touch the context subtotals.
+        stats.record_request("/v1/messages", "m", 100, 60, 200, 0.1)
+        # Two Context Engine requests: saved 40 then 50, fetching 2 then 1 events.
+        stats.record_request("/v1/messages", "m", 100, 60, 200, 0.1,
+                             context_store=True, events_fetched=2)
+        stats.record_request("/v1/messages", "m", 90, 40, 200, 0.1,
+                             context_store=True, events_fetched=1)
+        totals = stats.load()["totals"]
+        assert totals["requests"] == 3
+        assert totals["context_requests"] == 2
+        assert totals["context_saved"] == 40 + 50
+        assert totals["context_events_fetched"] == 3
+
+    def test_old_stats_file_backfills_context_keys(self):
+        stats._save({
+            "proxy": {},
+            "totals": {"requests": 1, "tokens_before": 10, "tokens_after": 5,
+                       "tokens_saved": 5},
+            "recent": [],
+        })
+        totals = stats.load()["totals"]
+        assert totals["context_requests"] == 0
+        assert totals["context_saved"] == 0
+        assert totals["context_events_fetched"] == 0
+
+
 class TestRealUsage:
     def test_record_accumulates_real_usage(self):
         stats.mark_started("127.0.0.1", 8889)

@@ -32,7 +32,7 @@ from typing import Any, Dict, List
 
 from aiohttp import web
 
-from tokensnap import __version__, history, openrouter, stats
+from tokensnap import __version__, context_store, history, openrouter, stats
 from tokensnap import config as config_mod
 
 DEFAULT_PORT = 9876
@@ -82,6 +82,8 @@ def _public_config() -> Dict[str, Any]:
         "openrouter_model": cfg["openrouter_model"],
         "openrouter_fallback_models": list(cfg.get("openrouter_fallback_models") or []),
         "openrouter_api_key_set": bool(str(cfg.get("openrouter_api_key", "")).strip()),
+        "context_store_enabled": bool(cfg.get("context_store_enabled", False)),
+        "context_tree_size": int(cfg.get("context_tree_size", 20)),
     }
 
 
@@ -153,6 +155,22 @@ async def api_log(request: web.Request) -> web.Response:
     return web.json_response({"lines": tail_log(200)})
 
 
+async def api_context(request: web.Request) -> web.Response:
+    """Differential Context Engine status for the dashboard/settings panel:
+    whether it's on, how big the tree is, how many events are mirrored in the
+    Context Store, and the tokens/recalls it has accounted for this session."""
+    cfg = config_mod.load()
+    totals = stats.load()["totals"]
+    return web.json_response({
+        "enabled": bool(cfg.get("context_store_enabled", False)),
+        "tree_size": int(cfg.get("context_tree_size", 20)),
+        "events_stored": context_store.event_count(),
+        "context_requests": totals.get("context_requests", 0),
+        "tokens_saved": totals.get("context_saved", 0),
+        "events_fetched": totals.get("context_events_fetched", 0),
+    })
+
+
 async def api_openrouter_status(request: web.Request) -> web.Response:
     """OpenRouter model/fallback/rate-limit status, for the Settings page
     and the Dashboard's Memory Cards indicator."""
@@ -208,7 +226,7 @@ async def _apply_settings(request: web.Request) -> Dict[str, Any]:
 
     saved: Dict[str, Any] = {}
     for key in ("keep_messages", "selective_compression", "compressor_type",
-                "openrouter_model"):
+                "openrouter_model", "context_store_enabled", "context_tree_size"):
         if key not in body or body[key] in (None, ""):
             continue
         try:
@@ -320,6 +338,7 @@ def build_app() -> web.Application:
     app.router.add_get("/api/chart", api_chart)
     app.router.add_get("/api/log", api_log)
     app.router.add_get("/api/openrouter-status", api_openrouter_status)
+    app.router.add_get("/api/context", api_context)
     app.router.add_get("/setup", setup_page)
     app.router.add_post("/setup/save", setup_save)
     app.router.add_get("/settings", settings_page)
@@ -757,6 +776,20 @@ def _settings_page() -> str:
     <div id='orstatus' class='sub'>Loading...</div>
   </div>
 
+  <div class='panel' style='margin-top:18px;padding:14px 18px'>
+    <div style='font-size:12.5px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;margin-bottom:8px'>
+      Differential Context Engine <span class='muted' style='text-transform:none;letter-spacing:0'>&mdash; experimental</span></div>
+    <p class='sub' style='margin-top:0'>Mirrors the whole conversation to a local store and sends the model only the last couple of exchanges plus a compact Context Tree, with a <code>fetch_context</code> tool to pull detail back on demand. Maximizes token reduction, but rewrites the system prompt each turn (which invalidates Anthropic prompt caching) and buffers the reply instead of streaming it &mdash; leave off unless you've measured it for your workload.</p>
+    <label class='f'>Context Engine</label>
+    <select id='ctxenabled'>
+      <option value='false'>off &mdash; use Memory Card compression (default)</option>
+      <option value='true'>on &mdash; Differential Context Engine</option>
+    </select>
+    <label class='f'>Context Tree size <small>(recent important events summarized in the tree)</small></label>
+    <input type='number' id='ctxtree' min='1'>
+    <div id='ctxstats' class='sub' style='margin-top:10px'>Loading&hellip;</div>
+  </div>
+
   <div style='display:flex;gap:12px;margin-top:24px;flex-wrap:wrap'>
     <button class='btn primary lg' id='save'>Save settings</button>
     <button class='btn lg' id='launchClaudeBtn'>&#128640; Launch Claude Code with current settings</button>
@@ -781,6 +814,20 @@ document.getElementById('compressor_type').value=cfg.compressor_type||'regex';
 document.getElementById('model').value=cfg.openrouter_model||'';
 document.getElementById('fallback').value=(cfg.openrouter_fallback_models||[]).join(', ');
 document.getElementById('keystatus').textContent=cfg.openrouter_api_key_set?'(a key is set)':'(no key set)';
+document.getElementById('ctxenabled').value=cfg.context_store_enabled?'true':'false';
+document.getElementById('ctxtree').value=cfg.context_tree_size||20;
+async function loadCtxStatus(){
+  var el=document.getElementById('ctxstats');
+  try{
+    var c=await (await fetch('/api/context')).json();
+    el.innerHTML='Status: <b>'+(c.enabled?'on':'off')+'</b> &middot; '+
+      'events mirrored: <b>'+c.events_stored+'</b> &middot; '+
+      'requests via engine: <b>'+c.context_requests+'</b> &middot; '+
+      'est. tokens saved: <b>'+c.tokens_saved.toLocaleString()+'</b> &middot; '+
+      'context recalls served: <b>'+c.events_fetched+'</b>';
+  }catch(e){el.textContent='Unavailable';}
+}
+loadCtxStatus();setInterval(loadCtxStatus,10000);
 document.querySelectorAll('.presets button').forEach(function(b){
   b.onclick=function(){document.getElementById('keep').value=b.dataset.keep;
     document.querySelectorAll('.presets button').forEach(function(x){x.style.borderColor='';});
@@ -813,7 +860,9 @@ document.getElementById('save').onclick=async function(){
     selective_compression:document.getElementById('selective').value,
     compressor_type:document.getElementById('compressor_type').value,
     openrouter_model:document.getElementById('model').value.trim(),
-    openrouter_fallback_models:document.getElementById('fallback').value.trim()};
+    openrouter_fallback_models:document.getElementById('fallback').value.trim(),
+    context_store_enabled:document.getElementById('ctxenabled').value,
+    context_tree_size:parseInt(document.getElementById('ctxtree').value,10)||20};
   var key=document.getElementById('apikey').value.trim();
   if(clearKeyRequested)payload.clear_key=true;
   else if(key)payload.openrouter_api_key=key;
@@ -821,6 +870,7 @@ document.getElementById('save').onclick=async function(){
     headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)})).json();
   toast(r.ok?'Settings saved':'Save failed');
   clearKeyRequested=false;
+  loadCtxStatus();
   document.getElementById('keystatus').textContent=(r.saved&&('openrouter_api_key_set' in r.saved))?
     (r.saved.openrouter_api_key_set?'(a key is set)':'(no key set)'):document.getElementById('keystatus').textContent;
   loadORStatus();

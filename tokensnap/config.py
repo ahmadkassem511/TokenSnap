@@ -70,6 +70,18 @@ DEFAULTS: Dict[str, Any] = {
     # capped at 1 + this value.
     "openrouter_max_retries": 1,
     "openrouter_retry_delay_seconds": 5,
+    # --- Differential Context Engine ---------------------------------------
+    # When True, the proxy mirrors the whole conversation to a local Context
+    # Store (~/.tokensnap/context_store.db) and sends the model only the last
+    # couple of exchanges plus a compact "Context Tree" (an index of important
+    # past events) with a `fetch_context` tool to pull detail back on demand -
+    # instead of the Memory Card path. Opt-in: it rewrites the system prompt
+    # every turn (which invalidates Anthropic prompt caching), and the
+    # fetch_context tool cycle isn't served until Phase 3, so leave it off
+    # until you've measured real cache/cost impact for your workload.
+    "context_store_enabled": False,
+    # How many recent important events the Context Tree summarizes.
+    "context_tree_size": 20,
     # Optional stored API key (normally unused: the proxy forwards the
     # key Claude Code already sends in request headers)
     "key": "",
@@ -84,6 +96,8 @@ _TYPES = {
     "min_messages_to_compress": int,
     "context_threshold": float,
     "selective_compression": _to_bool,
+    "context_store_enabled": _to_bool,
+    "context_tree_size": int,
     "openrouter_fallback_models": _to_model_list,
     "openrouter_max_retries": int,
     "openrouter_retry_delay_seconds": float,

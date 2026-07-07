@@ -1,9 +1,13 @@
 """Offline tests for tokensnap.proxy.optimize_body: confirms the proxy wires
 the configured `keep_messages` value into the compressor (not a hardcoded
-constant), and that the aggressive-mode threshold is read from config.
+constant), that the aggressive-mode threshold is read from config, and that
+the Differential Context Engine path activates only when opted in.
 """
 
+import pytest
+
 from tokensnap import config as config_mod
+from tokensnap import context_store
 from tokensnap.proxy import optimize_body
 
 
@@ -100,3 +104,61 @@ class TestAggressiveThreshold:
         body = {"model": "claude-sonnet-5", "messages": _long_history(10)}
         _, meta = optimize_body(body, _cfg(context_threshold=0.0001))
         assert meta["aggressive"] is True
+
+
+class TestContextStoreDisabledByDefault:
+    def test_default_path_never_adds_context_tree_or_tool(self):
+        body = {"model": "claude-sonnet-5", "messages": _long_history(20)}
+        new_body, meta = optimize_body(body, _cfg())
+        assert "context_store" not in meta  # classic path taken
+        assert "tools" not in new_body
+        system = new_body.get("system") or ""
+        assert "CONTEXT TREE" not in (system if isinstance(system, str) else str(system))
+
+
+class TestDifferentialContextPath:
+    @pytest.fixture(autouse=True)
+    def isolated_db(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(context_store, "DB_FILE", tmp_path / "context_store.db")
+        yield
+
+    def test_long_history_rebuilt_as_tree_plus_tail(self):
+        body = {"model": "claude-sonnet-5", "messages": _long_history(20)}
+        new_body, meta = optimize_body(body, _cfg(context_store_enabled=True))
+        assert meta["context_store"] is True
+        assert meta["compressed"] is True
+        # Only the last 2 exchanges remain verbatim.
+        assert len(new_body["messages"]) == 4
+        assert meta["events_omitted"] == 40 - 4
+        # fetch_context tool merged in.
+        assert any(t["name"] == "fetch_context" for t in new_body["tools"])
+        # Context Tree injected into system.
+        system = new_body["system"]
+        text = system if isinstance(system, str) else str(system)
+        assert "CONTEXT TREE" in text
+        # Fewer estimated tokens than the original.
+        assert meta["after"] < meta["before"]
+
+    def test_events_are_persisted_to_the_store(self):
+        body = {"model": "claude-sonnet-5", "messages": _long_history(20)}
+        optimize_body(body, _cfg(context_store_enabled=True))
+        # Every non-empty message was mirrored into external memory.
+        assert context_store.event_count() == 40
+
+    def test_short_history_not_reconstructed(self):
+        body = {"model": "claude-sonnet-5", "messages": _long_history(2)}
+        new_body, meta = optimize_body(body, _cfg(context_store_enabled=True))
+        assert meta["context_store"] is True
+        assert meta["compressed"] is False
+        assert "tools" not in new_body  # nothing omitted -> no tool advertised
+        assert len(new_body["messages"]) == 4
+
+    def test_existing_tools_are_preserved(self):
+        body = {
+            "model": "claude-sonnet-5",
+            "messages": _long_history(20),
+            "tools": [{"name": "Bash"}, {"name": "Read"}],
+        }
+        new_body, _ = optimize_body(body, _cfg(context_store_enabled=True))
+        names = [t["name"] for t in new_body["tools"]]
+        assert names == ["Bash", "Read", "fetch_context"]

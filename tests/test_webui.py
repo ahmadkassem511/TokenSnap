@@ -44,6 +44,64 @@ class TestBuildApp:
         for expected in ("/", "/setup", "/settings", "/api/stats", "/api/chart", "/api/log"):
             assert expected in paths
 
+    def test_registers_context_route(self):
+        app = webui.build_app()
+        paths = {r.resource.canonical for r in app.router.routes()}
+        assert "/api/context" in paths
+
+
+class TestContextEngineDashboard:
+    @pytest.fixture(autouse=True)
+    def isolated(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(webui.config_mod, "CONFIG_DIR", tmp_path)
+        monkeypatch.setattr(webui.config_mod, "CONFIG_FILE", tmp_path / "config.json")
+        monkeypatch.setattr(webui.stats, "STATS_DIR", tmp_path)
+        monkeypatch.setattr(webui.stats, "STATS_FILE", tmp_path / "stats.json")
+        monkeypatch.setattr(webui.context_store, "DB_FILE", tmp_path / "context_store.db")
+        yield
+
+    def _context_json(self):
+        return json.loads(asyncio.run(webui.api_context(None)).text)
+
+    def test_reports_disabled_and_zero_by_default(self):
+        data = self._context_json()
+        assert data["enabled"] is False
+        assert data["tree_size"] == 20
+        assert data["events_stored"] == 0
+        assert data["tokens_saved"] == 0
+
+    def test_reports_stored_events_and_enabled(self):
+        from tokensnap import config as config_mod, context_store
+
+        config_mod.set_value("context_store_enabled", "true")
+        context_store.store_message("s", 0, "user", "hi", "hi", "error")
+        context_store.store_message("s", 1, "assistant", "yo", "yo", "decision")
+        data = self._context_json()
+        assert data["enabled"] is True
+        assert data["events_stored"] == 2
+
+    def test_public_config_includes_context_keys(self):
+        cfg = webui._public_config()
+        assert cfg["context_store_enabled"] is False
+        assert cfg["context_tree_size"] == 20
+
+    def test_apply_settings_saves_context_keys(self):
+        from tokensnap import config as config_mod
+
+        class FakeRequest:
+            async def json(self_inner):
+                return {"context_store_enabled": "true", "context_tree_size": "35"}
+
+        asyncio.run(webui._apply_settings(FakeRequest()))
+        loaded = config_mod.load()
+        assert loaded["context_store_enabled"] is True
+        assert loaded["context_tree_size"] == 35
+
+    def test_settings_page_has_context_engine_toggle(self):
+        html = webui._settings_page()
+        assert "id='ctxenabled'" in html
+        assert "Differential Context Engine" in html
+
     def test_registers_openrouter_status_route(self):
         app = webui.build_app()
         paths = {r.resource.canonical for r in app.router.routes()}

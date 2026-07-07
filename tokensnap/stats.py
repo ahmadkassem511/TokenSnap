@@ -45,6 +45,12 @@ _EMPTY: Dict[str, Any] = {
         "real_output": 0,
         "real_cache_read": 0,
         "real_cache_creation": 0,
+        # Differential Context Engine subtotals (subset of the above): how many
+        # requests took the Context Store path, the estimated tokens it saved,
+        # and how many past events fetch_context served back on demand.
+        "context_requests": 0,
+        "context_saved": 0,
+        "context_events_fetched": 0,
     },
     "recent": [],
 }
@@ -125,6 +131,8 @@ def record_request(
     real_output: int = 0,
     real_cache_read: int = 0,
     real_cache_creation: int = 0,
+    context_store: bool = False,
+    events_fetched: int = 0,
 ) -> None:
     data = load()
     saved = max(0, tokens_before - tokens_after)
@@ -137,6 +145,10 @@ def record_request(
     totals["real_output"] += real_output
     totals["real_cache_read"] += real_cache_read
     totals["real_cache_creation"] += real_cache_creation
+    if context_store:
+        totals["context_requests"] += 1
+        totals["context_saved"] += saved
+        totals["context_events_fetched"] += max(0, events_fetched)
     now = time.time()
     data["recent"].append(
         {

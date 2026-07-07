@@ -74,6 +74,30 @@ def _transform_content(content: Any, fn: Callable[[str], str]) -> Any:
     return content
 
 
+def system_to_parts(system: Any) -> List[str]:
+    """Return the text parts of an Anthropic `system` field, which may be a
+    plain string, a list of blocks, or absent. Non-text blocks are ignored."""
+    if isinstance(system, str):
+        return [system]
+    parts: List[str] = []
+    if isinstance(system, list):
+        for block in system:
+            if isinstance(block, dict) and isinstance(block.get("text"), str):
+                parts.append(block["text"])
+    return parts
+
+
+def append_to_system(system: Any, extra: str) -> Any:
+    """Append text to a system prompt that may be a string, block list, or absent."""
+    if system is None or system == "":
+        return extra
+    if isinstance(system, str):
+        return system + "\n\n" + extra
+    if isinstance(system, list):
+        return system + [{"type": "text", "text": extra}]
+    return system
+
+
 def is_tool_result_only(message: Dict[str, Any]) -> bool:
     """True when a user message carries nothing but tool_result blocks.
 

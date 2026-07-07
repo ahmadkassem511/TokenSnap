@@ -23,6 +23,7 @@ the ever-growing conversation history that silently eats your usage limits.
 - [Tuning for your project type](#tuning-for-your-project-type)
 - [How selective compression works](#how-selective-compression-works)
 - [Smarter Memory Cards with OpenRouter](#smarter-memory-cards-with-openrouter)
+- [Differential Context Engine — The Next Level of Token Saving](#differential-context-engine--the-next-level-of-token-saving)
 - [Architecture](#architecture)
 - [Estimated vs. real tokens](#estimated-vs-real-tokens)
 - [Safety & scope](#safety--scope)
@@ -286,6 +287,8 @@ Stored in `~/.tokensnap/config.json`. Everything has a sensible default:
 | `openrouter_fallback_models` | *(empty)* | Comma-separated backup models tried in order if the primary model hits a rate limit or is down (429/5xx/timeout). |
 | `openrouter_max_retries` | `1` | Total attempts across the primary model + fallbacks is capped at `1 + this value`. |
 | `openrouter_retry_delay_seconds` | `5` | Seconds to wait before trying the next fallback model. |
+| `context_store_enabled` | `false` | Opt-in [Differential Context Engine](#differential-context-engine--the-next-level-of-token-saving): mirror the conversation locally and send only a Context Tree + last exchanges + a `fetch_context` tool, instead of a Memory Card. See that section's trade-offs. |
+| `context_tree_size` | `20` | How many recent important events the Context Tree summarizes (only used when `context_store_enabled`). |
 | `log_level` | `INFO` | Proxy log verbosity. |
 | `key` | *(empty)* | Optional stored Anthropic API key — normally unnecessary; the proxy forwards the key from request headers. |
 
@@ -458,6 +461,64 @@ sent to OpenRouter never carries your Anthropic key, and Anthropic requests
 never carry your OpenRouter key. The dashboard never re-displays a saved
 key to the browser, only whether one is set.
 
+## Differential Context Engine — The Next Level of Token Saving
+
+Memory Cards still send a *summary of everything* on every request. The
+**Differential Context Engine** changes the model entirely: TokenSnap keeps a
+full local mirror of the conversation and sends the model only the last couple
+of exchanges plus a compact **Context Tree** — an index of the important past
+events — handing it a `fetch_context` tool to pull back the full text of any
+event *only when it actually needs it*.
+
+It's **experimental and off by default.** Turn it on with:
+
+```bash
+tokensnap config set context_store_enabled true
+```
+
+or from the dashboard's **Settings → Differential Context Engine** panel (which
+also shows how many events are mirrored and what the engine has saved).
+
+### How it works
+
+1. **Mirror.** Every user/assistant message the proxy sees is stored in a
+   local SQLite database (`~/.tokensnap/context_store.db`), keyed by its
+   position so re-sends of the same conversation never duplicate it. Each
+   message is tagged with an `event_type` (`decision`, `error`,
+   `file_modification`, `clarification`, or `other`).
+2. **Reconstruct.** The outgoing request keeps only the **last 2 exchanges**
+   verbatim (after selective compression). Everything older is replaced by a
+   single system block holding the **Context Tree** — a JSON array of
+   `{id, summary, type}` for the most recent important events
+   (`context_tree_size`, default 20) — plus a `fetch_context` tool definition.
+3. **Recall.** If the model calls `fetch_context` with some event ids, the
+   *proxy* answers it — it looks the events up in the mirror, feeds their full
+   text back as a `tool_result`, and continues the turn upstream itself. Claude
+   Code only ever sees the final answer; the recall round-trip is invisible.
+
+```
+tree in  ─▶  model asks fetch_context([3,5])  ─▶  proxy serves events 3 & 5
+                                                    from the local mirror
+                                                        │
+   client sees only the final answer  ◀───────────────┘  (continues upstream)
+```
+
+### Trade-offs to understand before enabling
+
+- **Prompt caching.** The Context Tree is rewritten every turn, which
+  invalidates Anthropic's prompt cache. Claude Code leans on that cache
+  heavily, so watch **real** input/cache-read tokens (in `tokensnap monitor`
+  or the dashboard), not just the local *estimated* savings — on some
+  workloads the cache loss can offset the smaller request.
+- **Streaming.** While the fetch loop runs, upstream requests are made
+  non-streaming so the proxy can inspect them; the final reply is re-emitted
+  to Claude Code as a well-formed event stream, but it arrives once complete
+  rather than token-by-token.
+- **Config:** `context_store_enabled` (default `false`) and
+  `context_tree_size` (default `20`). With it **off, behavior is byte-for-byte
+  identical to Memory Card mode** — this feature adds nothing to the classic
+  path.
+
 ## Architecture
 
 ```
@@ -467,14 +528,21 @@ Claude Code  --ANTHROPIC_BASE_URL-->  Tokensnap proxy (127.0.0.1:8889)  -->  api
                                             |-- compressor.py    selective compression, Memory Card, truncation
                                             |-- openrouter.py    optional hosted-LLM card writer (regex fallback)
                                             |-- token_counter.py tiktoken-based budget check
+                                            |-- context_store.py local conversation mirror (SQLite)
+                                            |-- context_engine.py Context Tree builder (Differential Context)
+                                            |-- fetch_context.py proxy-side fetch_context tool cycle
                                             '-- stats.py         savings + liveness for status/monitor
 ```
 
 Only `POST /v1/messages` and `/v1/complete` request *bodies* are touched, and
-only on the way out. Every response — including SSE streams — is relayed back
-byte-for-byte, so Claude Code behaves exactly as if it were talking to
-Anthropic directly. As responses stream through, Tokensnap reads (but never
-alters) the `usage` field to report real token consumption.
+only on the way out. In the default (Memory Card) mode every response —
+including SSE streams — is relayed back byte-for-byte, so Claude Code behaves
+exactly as if it were talking to Anthropic directly, and as responses stream
+through Tokensnap reads (but never alters) the `usage` field to report real
+token consumption. The one exception is the opt-in
+[Differential Context Engine](#differential-context-engine--the-next-level-of-token-saving),
+which answers `fetch_context` tool calls itself and re-emits the final message
+to the client (see that section's streaming note).
 
 ## Estimated vs. real tokens
 
