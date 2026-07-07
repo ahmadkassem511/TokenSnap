@@ -158,6 +158,149 @@ class TestCompressMessages:
         assert len(out) == 4
 
 
+class TestOffMode:
+    def test_off_disables_truncation_entirely(self):
+        msgs = _long_history()
+        card, out = compressor.compress_messages(
+            msgs, keep_last_n=1, min_messages=1, llm_cfg={"compressor_type": "off"}
+        )
+        assert card is None
+        assert out == msgs  # full history, untouched
+
+    def test_off_beats_a_tiny_keep_last_n(self):
+        # Even a keep_last_n that would normally force a cut is ignored.
+        msgs = _long_history() * 3
+        card, out = compressor.compress_messages(
+            msgs, keep_last_n=1, min_messages=1, llm_cfg={"compressor_type": "off"}
+        )
+        assert card is None
+        assert len(out) == len(msgs)
+
+    def test_regex_and_openrouter_still_compress(self):
+        msgs = _long_history()
+        for compressor_type in ("regex", "openrouter"):
+            card, out = compressor.compress_messages(
+                msgs, keep_last_n=3, min_messages=8,
+                llm_cfg={"compressor_type": compressor_type},
+            )
+            assert card is not None
+            assert len(out) < len(msgs)
+
+
+class TestSelectiveCompression:
+    def test_assistant_messages_always_pass_through(self):
+        dump = "\n".join(["error: line %d" % i for i in range(600)])
+        msg = {"role": "assistant", "content": dump}
+        assert compressor._compress_message_selectively(msg) is msg
+
+    def test_short_user_text_untouched(self):
+        msg = {"role": "user", "content": "please fix the bug in main.py"}
+        out = compressor._compress_message_selectively(msg)
+        assert out["content"] == msg["content"]
+
+    def test_large_user_terminal_dump_is_compressed(self):
+        dump = "\n".join(["npm WARN noisy line %d" % i for i in range(300)] + ["error: build failed"])
+        msg = {"role": "user", "content": dump}
+        out = compressor._compress_message_selectively(msg)
+        assert len(out["content"]) < len(dump)
+        assert "error: build failed" in out["content"]
+        assert "tokensnap" in out["content"]
+
+    def test_user_prose_preamble_and_question_survive_around_dump(self):
+        dump = "\n".join(["error: something broke at line %d" % i for i in range(400)])
+        text = "Can you check this error?\n\n" + dump + "\n\nWhat should I do?"
+        msg = {"role": "user", "content": text}
+        out = compressor._compress_message_selectively(msg)
+        assert "Can you check this error?" in out["content"]
+        assert "What should I do?" in out["content"]
+        assert len(out["content"]) < len(text)
+
+    def test_tool_result_compressed_to_signal_lines(self):
+        dump = "\n".join(
+            ["npm WARN deprecated pkg@1.0.0"] * 5
+            + ["line %d" % i for i in range(150)]
+            + ["error: build failed", "Build finished with 1 error"]
+        )
+        msg = {
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": "t1", "content": dump}],
+        }
+        out = compressor._compress_message_selectively(msg)
+        text = out["content"][0]["content"]
+        assert "error: build failed" in text
+        assert "Build finished with 1 error" in text
+        assert len(text) < len(dump)
+        assert "1 error" in text or "1 warning" in text  # omission summary present
+
+    def test_small_tool_result_left_alone(self):
+        msg = {
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "2 tests passed"}],
+        }
+        out = compressor._compress_message_selectively(msg)
+        assert out["content"][0]["content"] == "2 tests passed"
+
+    def test_pathological_dense_errors_still_capped(self):
+        # Every line matches the error pattern (distinct line numbers, so
+        # dedup can't collapse them) - the cap must still kick in.
+        dump = "\n".join("ERROR: broke at line %d" % i for i in range(200))
+        text = compressor._extract_signal_lines(dump)
+        # first+last half of the cap, plus the omission summary line
+        assert text.count("\n") + 1 <= compressor._MAX_SIGNAL_LINES + 1
+        assert "200 errors" in text
+
+    def test_tool_use_blocks_never_touched(self):
+        msg = {
+            "role": "assistant",
+            "content": [{"type": "tool_use", "id": "t1", "name": "bash", "input": {"command": "x"}}],
+        }
+        out = compressor._compress_message_selectively(msg)
+        assert out == msg
+
+
+class TestBuildCompressedContext:
+    def _agentic_history(self):
+        msgs = [{"role": "user", "content": "Fix the failing tests in src/app.py"}]
+        for i in range(8):
+            msgs.append({
+                "role": "assistant",
+                "content": [{"type": "tool_use", "id": "t%d" % i, "name": "bash", "input": {}}],
+            })
+            dump = "\n".join(["retrying..."] * 3 + ["error: test %d failed" % i])
+            msgs.append({
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": "t%d" % i, "content": dump}],
+            })
+        return msgs
+
+    def test_compresses_and_cleans_tool_results(self):
+        msgs = self._agentic_history()
+        card, out = compressor.build_compressed_context(
+            msgs, keep_messages=2, cfg={"compressor_type": "regex"}, min_messages=4
+        )
+        assert card is not None
+        assert len(out) < len(msgs)
+        # Every tool_result surviving in the tail is still paired with its tool_use
+        for i, m in enumerate(out):
+            if is_tool_result_only(m):
+                prev = out[i - 1]["content"]
+                assert any(b.get("type") == "tool_use" for b in prev)
+
+    def test_off_keeps_everything_but_still_cleans_messages(self):
+        msgs = self._agentic_history()
+        card, out = compressor.build_compressed_context(
+            msgs, keep_messages=2, cfg={"compressor_type": "off"}, min_messages=4
+        )
+        assert card is None
+        assert len(out) == len(msgs)
+
+    def test_default_cfg_is_safe(self):
+        # cfg=None must not crash - callers may omit it.
+        msgs = self._agentic_history()
+        card, out = compressor.build_compressed_context(msgs, keep_messages=2, min_messages=4)
+        assert isinstance(out, list)
+
+
 class TestBuildMemoryCard:
     def test_task_from_first_user_message(self):
         card = compressor.build_memory_card(

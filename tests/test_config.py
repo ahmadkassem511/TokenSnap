@@ -1,5 +1,5 @@
-"""Offline tests for tokensnap.config: defaults, coercion, and the
-keep_last_n -> keep_messages migration/alias.
+"""Offline tests for tokensnap.config: defaults, coercion, and migrations
+from pre-0.4 (Ollama-based) and pre-0.3 (keep_last_n) config files.
 """
 
 import json
@@ -27,9 +27,24 @@ class TestDefaults:
         # keep_last_n was renamed; it must not linger as a live default.
         assert "keep_last_n" not in config_mod.DEFAULTS
 
+    def test_no_ollama_keys(self):
+        # Ollama was replaced by OpenRouter; none of its keys should remain.
+        for key in ("llm_compressor", "ollama_url", "ollama_model", "ollama_timeout"):
+            assert key not in config_mod.DEFAULTS
+
+    def test_openrouter_defaults_present(self):
+        assert config_mod.DEFAULTS["compressor_type"] == "regex"
+        assert config_mod.DEFAULTS["openrouter_api_key"] == ""
+        assert config_mod.DEFAULTS["openrouter_model"] == "meta-llama/llama-3.1-8b-instruct:free"
+
+    def test_selective_compression_defaults_true(self):
+        assert config_mod.DEFAULTS["selective_compression"] is True
+
     def test_load_without_file_returns_defaults(self):
         cfg = config_mod.load()
         assert cfg["keep_messages"] == 10
+        assert cfg["compressor_type"] == "regex"
+        assert cfg["selective_compression"] is True
 
 
 class TestResolveKeyAlias:
@@ -40,7 +55,7 @@ class TestResolveKeyAlias:
         assert config_mod.resolve_key("keep_last_n") == "keep_messages"
 
     def test_unrelated_key_untouched(self):
-        assert config_mod.resolve_key("ollama_model") == "ollama_model"
+        assert config_mod.resolve_key("openrouter_model") == "openrouter_model"
 
 
 class TestSetValue:
@@ -60,19 +75,46 @@ class TestSetValue:
     def test_context_threshold_still_coerces_to_float(self):
         assert config_mod.set_value("context_threshold", "0.85") == 0.85
 
+    def test_set_openrouter_api_key(self):
+        assert config_mod.set_value("openrouter_api_key", "sk-or-test") == "sk-or-test"
+        assert config_mod.load()["openrouter_api_key"] == "sk-or-test"
+
+    def test_set_openrouter_model(self):
+        assert config_mod.set_value("openrouter_model", "some/model") == "some/model"
+
+    def test_compressor_type_choices_validated(self):
+        assert config_mod.set_value("compressor_type", "OPENROUTER") == "openrouter"
+        assert config_mod.load()["compressor_type"] == "openrouter"
+        with pytest.raises(ValueError):
+            config_mod.set_value("compressor_type", "ollama")
+
+    def test_ollama_key_no_longer_settable(self):
+        # Ollama keys were removed outright, not aliased to anything.
+        with pytest.raises(KeyError):
+            config_mod.set_value("ollama_model", "x")
+
+    @pytest.mark.parametrize(
+        "raw,expected",
+        [("true", True), ("True", True), ("1", True), ("yes", True), ("on", True),
+         ("false", False), ("0", False), ("no", False), ("off", False)],
+    )
+    def test_selective_compression_bool_coercion(self, raw, expected):
+        assert config_mod.set_value("selective_compression", raw) is expected
+
+    def test_selective_compression_rejects_junk(self):
+        with pytest.raises(ValueError):
+            config_mod.set_value("selective_compression", "maybe")
+
 
 class TestLegacyFileMigration:
-    def test_old_config_file_migrates_value_on_load(self, tmp_path):
-        # Simulates an existing pre-0.3 ~/.tokensnap/config.json (like the
-        # one this project's own real installs had) that stores the old key.
+    def test_keep_last_n_migrates_value_on_load(self, tmp_path):
         (tmp_path / "config.json").write_text(
-            json.dumps({"keep_last_n": 3, "ollama_model": "qwen2.5:7b"}),
-            encoding="utf-8",
+            json.dumps({"keep_last_n": 3, "host": "0.0.0.0"}), encoding="utf-8"
         )
         cfg = config_mod.load()
         assert cfg["keep_messages"] == 3  # migrated, not reset to the new default
         assert "keep_last_n" not in cfg
-        assert cfg["ollama_model"] == "qwen2.5:7b"  # untouched keys preserved
+        assert cfg["host"] == "0.0.0.0"  # untouched keys preserved
 
     def test_new_key_wins_if_both_present(self, tmp_path):
         (tmp_path / "config.json").write_text(
@@ -96,3 +138,72 @@ class TestLegacyFileMigration:
         (tmp_path / "config.json").write_text("{not valid json", encoding="utf-8")
         cfg = config_mod.load()
         assert cfg["keep_messages"] == 10
+
+    @pytest.mark.parametrize("old_value", ["auto", "ollama", "off"])
+    def test_llm_compressor_migrates_to_regex(self, tmp_path, old_value):
+        # All three pre-0.4 modes safely become "regex": there's no
+        # OpenRouter key to carry over, and "regex" preserves the old
+        # truncation behavior exactly (new "off" would disable it).
+        (tmp_path / "config.json").write_text(
+            json.dumps({"llm_compressor": old_value}), encoding="utf-8"
+        )
+        cfg = config_mod.load()
+        assert cfg["compressor_type"] == "regex"
+        assert "llm_compressor" not in cfg
+
+    def test_llm_compressor_does_not_override_explicit_compressor_type(self, tmp_path):
+        (tmp_path / "config.json").write_text(
+            json.dumps({"llm_compressor": "auto", "compressor_type": "openrouter"}),
+            encoding="utf-8",
+        )
+        cfg = config_mod.load()
+        assert cfg["compressor_type"] == "openrouter"
+
+    def test_ollama_keys_dropped_on_load(self, tmp_path):
+        (tmp_path / "config.json").write_text(
+            json.dumps(
+                {
+                    "llm_compressor": "auto",
+                    "ollama_url": "http://127.0.0.1:11434",
+                    "ollama_model": "qwen2.5:7b",
+                    "ollama_timeout": 10.0,
+                }
+            ),
+            encoding="utf-8",
+        )
+        cfg = config_mod.load()
+        for key in ("llm_compressor", "ollama_url", "ollama_model", "ollama_timeout"):
+            assert key not in cfg
+        assert cfg["compressor_type"] == "regex"
+
+    def test_real_world_pre_0_4_file_migrates_cleanly(self, tmp_path):
+        # The exact shape this project's own ~/.tokensnap/config.json had
+        # before the OpenRouter rewrite.
+        (tmp_path / "config.json").write_text(
+            json.dumps(
+                {
+                    "host": "127.0.0.1",
+                    "port": 8889,
+                    "upstream": "https://api.anthropic.com",
+                    "keep_messages": 15,
+                    "aggressive_keep_last_n": 2,
+                    "context_threshold": 0.9,
+                    "min_messages_to_compress": 8,
+                    "llm_compressor": "auto",
+                    "ollama_url": "http://127.0.0.1:11434",
+                    "ollama_model": "qwen2.5:3b",
+                    "ollama_timeout": 10.0,
+                    "key": "",
+                    "log_level": "INFO",
+                }
+            ),
+            encoding="utf-8",
+        )
+        cfg = config_mod.load()
+        assert cfg["keep_messages"] == 15
+        assert cfg["context_threshold"] == 0.9
+        assert cfg["compressor_type"] == "regex"
+        assert cfg["selective_compression"] is True  # not in the file -> default
+        assert cfg["openrouter_api_key"] == ""
+        for key in ("llm_compressor", "ollama_url", "ollama_model", "ollama_timeout"):
+            assert key not in cfg

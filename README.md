@@ -21,8 +21,8 @@ the ever-growing conversation history that silently eats your usage limits.
 - [Commands](#commands)
 - [Configuration](#configuration)
 - [Tuning for your project type](#tuning-for-your-project-type)
-- [How Memory Card compression works](#how-memory-card-compression-works)
-- [Smarter Memory Cards with Ollama](#smarter-memory-cards-with-ollama)
+- [How selective compression works](#how-selective-compression-works)
+- [Smarter Memory Cards with OpenRouter](#smarter-memory-cards-with-openrouter)
 - [Architecture](#architecture)
 - [Estimated vs. real tokens](#estimated-vs-real-tokens)
 - [Safety & scope](#safety--scope)
@@ -38,32 +38,45 @@ A session that starts at 2k tokens per request can quietly balloon to 150k+.
 You hit your usage limit not because you asked hard questions, but because of
 context bloat you never see.
 
+Blunt compression makes this worse in a different way: summarize *everything*
+uniformly and Claude starts losing the thread on complex work — forgetting a
+decision from ten messages ago, or a file it already fixed. Tokensnap's
+philosophy is to cut only the noise and leave the substance alone.
+
 ## The solution
 
-Tokensnap intercepts each API request and applies four optimizations:
+Tokensnap intercepts each API request and applies these optimizations:
 
-1. **ANSI & progress-bar stripping** — color escape codes, spinner frames, and
+1. **Selective per-message compression** (on by default) — assistant messages
+   (Claude's own reasoning) are **never touched**. User messages are left
+   intact unless they contain a large terminal/log dump, in which case only
+   that dump shrinks to its error/warning/status lines — any surrounding
+   prose survives untouched. Tool results are reduced the same way, more
+   aggressively, since they're almost always machine noise once the outcome
+   is known. See [How selective compression works](#how-selective-compression-works).
+2. **ANSI & progress-bar stripping** — color escape codes, spinner frames, and
    `\r`-redrawn progress bars are deleted from terminal output in the context.
-2. **Log deduplication** — runs of identical lines (retry storms, repeated
+3. **Log deduplication** — runs of identical lines (retry storms, repeated
    warnings) collapse into one line plus a repeat count.
-3. **Memory Card compression** — long conversation histories are summarized
-   into a compact JSON card (task, files modified, decisions, resolved errors)
-   injected as a system note. The last **N** exchanges (`keep_messages`,
-   default 10) are kept verbatim, so Claude never loses the thread of what
-   you're doing *right now* — tune this per project with `tokensnap preset`,
-   see [Tuning for your project type](#tuning-for-your-project-type).
-   If a local [Ollama](https://ollama.com) server is running, a local LLM
-   writes the card for you — more accurate than the built-in regex extraction,
-   which remains the automatic fallback. See
-   [Smarter Memory Cards with Ollama](#smarter-memory-cards-with-ollama).
-4. **Budget guard** — token usage is estimated with tiktoken on every request.
+4. **Memory Card compression** — history older than the last **N** exchanges
+   (`keep_messages`, default 10) is summarized into a compact JSON card
+   (task, files touched, decisions, resolved errors) injected as a system
+   note, so Claude never loses the thread of what you're doing *right now*.
+   Tune `keep_messages` per project with `tokensnap preset` — see
+   [Tuning for your project type](#tuning-for-your-project-type). A free
+   [OpenRouter](https://openrouter.ai) model can write a noticeably better
+   card than the built-in regex extraction; see
+   [Smarter Memory Cards with OpenRouter](#smarter-memory-cards-with-openrouter).
+5. **Budget guard** — token usage is estimated with tiktoken on every request.
    At 95% of the model's context window, Tokensnap automatically gets more
    aggressive: keeps fewer raw messages, drops file contents that appear twice,
    and trims the system prompt.
 
-Responses come back **completely untouched**, including streaming. Your API key
-never touches disk — Tokensnap simply forwards the auth headers Claude Code
-already sends.
+Responses come back **completely untouched**, including streaming. Your
+Anthropic API key never touches disk — Tokensnap simply forwards the auth
+headers Claude Code already sends. If you enable OpenRouter for smarter
+Memory Cards, that's a *separate* key you provide, used only for the
+summarization call and never mixed with your Anthropic key.
 
 ## Quickstart
 
@@ -113,7 +126,7 @@ tokensnap status     # one-shot summary
 ```
 
 The **web dashboard** (`tokensnap dashboard`) is the richest view: a first-run
-setup wizard (hardware detection + one-click Ollama model pull), historical
+setup wizard (compression preset + optional free OpenRouter key), historical
 savings charts (7 days / 8 weeks / 6 months), a live log, and a settings page.
 It runs independently of the proxy, so opening or closing it never interrupts
 request handling — you can leave the proxy running and open the dashboard
@@ -209,7 +222,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:8889
 | `tokensnap config show` | Print the effective configuration. |
 | `tokensnap config set <key> <value>` | Change a setting (see below). |
 | `tokensnap config get <key>` | Read one setting. |
-| `tokensnap preset <name>` | Apply a recommended `keep_messages` value for your project type: `simple`, `balanced`, `complex`, `maximum` — see [Tuning for your project type](#tuning-for-your-project-type). |
+| `tokensnap preset <name>` | Apply a recommended configuration for your project type: `simple`, `balanced`, `complex`, `smart`, `maximum` — see [Tuning for your project type](#tuning-for-your-project-type). |
 | `tokensnap mcp` | Run Tokensnap as an MCP stdio server (status/config/start/stop as tools) — see below. |
 
 ### Stopping and resetting
@@ -250,12 +263,12 @@ Stored in `~/.tokensnap/config.json`. Everything has a sensible default:
 | `aggressive_keep_last_n` | `2` | `keep_messages` drops to this when near the context window. |
 | `context_threshold` | `0.95` | Fraction of the context window that triggers aggressive mode. |
 | `min_messages_to_compress` | `8` | Histories shorter than this are never compressed. |
-| `llm_compressor` | `auto` | Memory Card generator: `auto` (use Ollama when running, else regex), `ollama` (same, but warn when unreachable), `off` (regex only). |
-| `ollama_url` | `http://127.0.0.1:11434` | Local Ollama server address. |
-| `ollama_model` | `llama3.2` | Model used to write Memory Cards. |
-| `ollama_timeout` | `10.0` | Seconds to wait for the local model before falling back to regex. |
+| `selective_compression` | `true` | Clean noise from every message (assistant untouched, terminal dumps/tool output reduced to signal) before truncating. `false` uses legacy uniform truncation only. |
+| `compressor_type` | `regex` | Memory Card generator: `regex` (fast, rule-based, offline), `openrouter` (a free hosted model writes a better summary), `off` (no Memory Card at all - full history kept, only noise cleaning applies). |
+| `openrouter_api_key` | *(empty)* | Your [OpenRouter](https://openrouter.ai/keys) key (free tier available). Required for `compressor_type=openrouter`. |
+| `openrouter_model` | `meta-llama/llama-3.1-8b-instruct:free` | Model used to write Memory Cards when `compressor_type=openrouter`. |
 | `log_level` | `INFO` | Proxy log verbosity. |
-| `key` | *(empty)* | Optional stored API key — normally unnecessary; the proxy forwards the key from request headers. |
+| `key` | *(empty)* | Optional stored Anthropic API key — normally unnecessary; the proxy forwards the key from request headers. |
 
 Example — keep more raw history:
 
@@ -281,85 +294,112 @@ The right value depends on what you're working on, so pick a preset instead
 of guessing:
 
 ```bash
-tokensnap preset simple     # keep_messages=5   - quick scripts, single-file tasks
-tokensnap preset balanced   # keep_messages=10  - the default, suitable for most projects
-tokensnap preset complex    # keep_messages=20  - large multi-file projects (e.g. DevReady-style codebases)
-tokensnap preset maximum    # keep_messages=999 - effectively disables compression (noise cleaning only)
+tokensnap preset simple     # keep_messages=5,   selective on,  regex   - quick scripts, single-file tasks
+tokensnap preset balanced   # keep_messages=10,  selective on,  regex   - the default, suitable for most projects
+tokensnap preset complex    # keep_messages=20,  selective off, regex  - large multi-file projects, maximal safety
+tokensnap preset smart      # keep_messages=25,  selective on,  openrouter - best quality (needs a free API key)
+tokensnap preset maximum    # keep_messages=999, selective on,  off     - effectively disables compression
 ```
 
 If Claude starts "forgetting" earlier decisions or files it already touched
 on a big project, that's a sign `keep_messages` is too low for that
-project — run `tokensnap preset complex` (or set a custom value) before
+project — run `tokensnap preset complex` or `tokensnap preset smart` before
 starting your next session. You can always fine-tune further with
 `tokensnap config set keep_messages <N>`.
 
-## How Memory Card compression works
+## How selective compression works
 
-When a request's `messages` array exceeds `min_messages_to_compress`, Tokensnap:
+Selective compression (`selective_compression = true`, the default) runs
+before the history is ever truncated, and treats every message differently
+based on its role:
+
+- **Assistant messages are never touched.** Claude's own reasoning and
+  responses are the entire point of "reasoning quality" - they're passed
+  through byte-for-byte, at every position in the conversation, not just
+  the recent tail.
+- **User messages** are left alone unless they contain a large terminal/log
+  dump (heuristically: over ~500 tokens and shaped like shell output). When
+  they do, only that dump shrinks — to its error/warning lines plus a final
+  status line — while any surrounding prose ("can you check this error?
+  ... what should I do?") survives untouched around it.
+- **Tool results** are compressed the same way, more aggressively, since
+  they're almost always machine-generated noise once the outcome is known.
+  A 200-line build log becomes a couple of error lines plus something like
+  `[tokensnap: 180 lines omitted (2 errors, 1 warning)]`.
+
+Set `selective_compression = false` (or use `tokensnap preset complex`) to
+go back to the legacy behavior: no per-message cleaning, just uniform
+truncation at `keep_messages`.
+
+Separately, once history exceeds `min_messages_to_compress`, Tokensnap:
 
 1. Splits the history: everything except the last `keep_messages` exchanges.
-2. Runs rule-based extraction over the old part: file paths touched, lines
-   like `Decision: …` / `we will use …`, and error→resolution pairs.
-3. Builds a compact JSON card and appends it to the request's system prompt.
-4. Sends only the card + the recent exchanges upstream.
+2. Summarizes the older part into a Memory Card — file paths touched, lines
+   like `Decision: …` / `we will use …`, and error→resolution pairs (regex),
+   or a free hosted model's summary (see below).
+3. Injects the card into the request's system prompt and sends only the
+   card + the recent exchanges upstream.
 
 The cut point is chosen carefully so the kept history always starts with a
 clean user message — tool_use/tool_result pairs are never split, which would
-otherwise cause API errors.
+otherwise cause API errors. Setting `compressor_type = off` skips this
+truncation step entirely: the full (but noise-cleaned) history is sent every
+request.
 
-## Smarter Memory Cards with Ollama
+## Smarter Memory Cards with OpenRouter
 
 Regex extraction is fast and dependency-free, but it can only recognize
-patterns it was taught. If you have [Ollama](https://ollama.com) installed,
-Tokensnap will ask a **local** LLM to write the Memory Card instead — it
-understands the conversation, so the card captures the task, decisions, and
-error resolutions far more accurately.
+patterns it was taught. [OpenRouter](https://openrouter.ai) gives free access
+to several hosted models (e.g. Meta's Llama 3.1 8B); point Tokensnap at one
+and it writes the Memory Card instead — it understands the conversation, so
+the card captures the task, decisions, and error resolutions far more
+accurately.
 
-This is on by default (`llm_compressor = auto`) and completely automatic:
+Get a free key at **[openrouter.ai/keys](https://openrouter.ai/keys)** (no
+cost, no local install), then:
 
-- On each request Tokensnap checks (at most once a minute) whether an Ollama
-  server answers at `ollama_url` **and** that `ollama_model` is actually
-  pulled. Either check failing → regex, zero overhead.
-- When available, the truncated history is sent to `ollama_model` with a
-  strict JSON-only prompt at temperature 0. The output is validated, clipped,
-  and **merged over the regex card** — regex-found file paths are always kept,
-  so nothing the old extractor caught is ever lost.
-- Any hiccup — model not pulled, timeout (`ollama_timeout`), malformed
+```bash
+tokensnap config set openrouter_api_key <your-key>
+tokensnap preset smart          # or: tokensnap config set compressor_type openrouter
+tokensnap run claude
+```
+
+How it works:
+
+- `compressor_type = openrouter` (set automatically by `tokensnap preset smart`)
+  sends the truncated history to `openrouter_model` with a strict JSON-only
+  prompt at temperature 0. The output is validated, clipped, and **merged
+  over the regex card** — regex-found file paths are always kept, so nothing
+  the old extractor caught is ever lost.
+- Any hiccup — no key configured, network error, rate limit, malformed
   output — falls back to the regex card. Results (including failures) are
-  cached per conversation, so a slow model never taxes every request.
-- LLM-written cards carry a `"generator": "ollama:<model>"` field so you can
-  tell which path produced them.
+  cached per conversation, so a slow or rate-limited model never taxes every
+  request.
+- LLM-written cards carry a `"generator": "openrouter:<model>"` field so you
+  can tell which path produced them.
 
-**If the configured model isn't pulled**, Tokensnap doesn't just silently
-degrade — it logs a clear message telling you what to do:
+**If no key is configured** while `compressor_type=openrouter`, Tokensnap
+doesn't just silently degrade — `tokensnap status` / `tokensnap monitor` and
+the proxy startup log show exactly what to do:
 
 ```
-Memory Cards: regex (Ollama is running at http://127.0.0.1:11434 but model
-'qwen2.5:7b' is not pulled. Run `ollama pull qwen2.5:7b`, or switch to
-regex-only cards with `tokensnap config set ollama_model ""`.)
+Memory Cards: regex (compressor_type=openrouter but no openrouter_api_key is
+set - get a free key at https://openrouter.ai/keys, then `tokensnap config
+set openrouter_api_key <key>`)
 ```
 
-This check runs on proxy startup (and is re-checked at most once a minute
-while running), and the current generator status is also visible in
-`tokensnap status` and `tokensnap monitor` (as "Memory Cards: ...").
-
-Setup is just:
+Want a different model, or want it off?
 
 ```bash
-ollama pull llama3.2          # once
-tokensnap run claude          # as usual — the proxy detects Ollama itself
+tokensnap config set openrouter_model qwen/qwen-2.5-7b-instruct:free
+tokensnap config set compressor_type regex
 ```
 
-The proxy logs which generator is active on startup. Prefer a different
-model, or want it off?
-
-```bash
-tokensnap config set ollama_model qwen2.5:7b
-tokensnap config set llm_compressor off
-```
-
-**Privacy:** the conversation transcript is only ever sent to your local
-Ollama server (localhost by default) — never to any third-party service.
+**Security:** the OpenRouter key is a *separate* credential from your
+Anthropic API key and is never mixed with it — the conversation transcript
+sent to OpenRouter never carries your Anthropic key, and Anthropic requests
+never carry your OpenRouter key. The dashboard never re-displays a saved
+key to the browser, only whether one is set.
 
 ## Architecture
 
@@ -367,8 +407,8 @@ Ollama server (localhost by default) — never to any third-party service.
 Claude Code  --ANTHROPIC_BASE_URL-->  Tokensnap proxy (127.0.0.1:8889)  -->  api.anthropic.com
                                             |
                                             |-- cleaner.py       strip ANSI / progress bars / dup lines
-                                            |-- compressor.py    build Memory Card, truncate history
-                                            |-- ollama.py        optional local-LLM card writer (regex fallback)
+                                            |-- compressor.py    selective compression, Memory Card, truncation
+                                            |-- openrouter.py    optional hosted-LLM card writer (regex fallback)
                                             |-- token_counter.py tiktoken-based budget check
                                             '-- stats.py         savings + liveness for status/monitor
 ```
@@ -406,7 +446,8 @@ have that variable set bypasses Tokensnap entirely.
   listing, etc.).
 - Responses — including SSE streams — are relayed verbatim.
 - Nothing is sent anywhere except the configured upstream and (only when
-  enabled and running) your local Ollama server. No telemetry.
+  `compressor_type=openrouter` and a key is set) OpenRouter, for the
+  Memory Card summarization call only. No telemetry.
 - Token counts use tiktoken's `cl100k_base` encoding, a close approximation
   for Claude models; if tiktoken can't load, a chars/4 estimate is used.
 
@@ -417,9 +458,10 @@ pip install -e .[dev]
 pytest
 ```
 
-The test suite (cleaner, compressor, Ollama integration, token counter,
-stats, CLI) runs fully offline — no network access, real API key, or Ollama
-install required (the Ollama tests mock the HTTP layer).
+The test suite (cleaner, compressor, selective compression, OpenRouter
+integration, token counter, stats, CLI, web dashboard) runs fully offline —
+no network access or real API keys required (the OpenRouter tests mock the
+HTTP layer).
 
 ## Contributing
 

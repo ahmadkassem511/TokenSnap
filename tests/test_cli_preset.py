@@ -31,19 +31,23 @@ def isolated_config(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "name,expected",
+    "name,keep_messages,selective,compressor_type",
     [
-        ("simple", 5),
-        ("balanced", 10),
-        ("complex", 20),
-        ("maximum", 999),
+        ("simple", 5, True, "regex"),
+        ("balanced", 10, True, "regex"),
+        ("complex", 20, False, "regex"),
+        ("smart", 25, True, "openrouter"),
+        ("maximum", 999, True, "off"),
     ],
 )
-def test_preset_sets_keep_messages(name, expected):
+def test_preset_sets_all_fields(name, keep_messages, selective, compressor_type):
     result = runner.invoke(cli.app, ["preset", name])
     assert result.exit_code == 0
-    assert str(expected) in result.stdout
-    assert config_mod.load()["keep_messages"] == expected
+    assert str(keep_messages) in result.stdout
+    cfg = config_mod.load()
+    assert cfg["keep_messages"] == keep_messages
+    assert cfg["selective_compression"] is selective
+    assert cfg["compressor_type"] == compressor_type
 
 
 def test_preset_is_case_insensitive():
@@ -65,3 +69,17 @@ def test_preset_then_status_shows_keep_messages():
     result = runner.invoke(cli.app, ["status"])
     assert result.exit_code == 0
     assert "keep_messages=20" in result.stdout
+
+
+def test_smart_preset_warns_when_no_api_key_configured():
+    result = runner.invoke(cli.app, ["preset", "smart"])
+    assert result.exit_code == 0
+    assert "no OpenRouter API key is set" in result.stdout
+    assert "openrouter.ai/keys" in result.stdout
+
+
+def test_smart_preset_no_warning_once_key_is_set():
+    config_mod.set_value("openrouter_api_key", "sk-or-test")
+    result = runner.invoke(cli.app, ["preset", "smart"])
+    assert result.exit_code == 0
+    assert "no OpenRouter API key" not in result.stdout

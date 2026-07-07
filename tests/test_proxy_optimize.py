@@ -17,7 +17,7 @@ def _long_history(n_exchanges):
 
 def _cfg(**overrides):
     cfg = dict(config_mod.DEFAULTS)
-    cfg["llm_compressor"] = "off"  # keep these tests fully offline
+    cfg["compressor_type"] = "regex"  # keep these tests fully offline
     cfg.update(overrides)
     return cfg
 
@@ -45,6 +45,46 @@ class TestKeepMessagesPlumbing:
         new_body, meta = optimize_body(body, _cfg(keep_messages=1))
         assert meta["compressed"] is False
         assert len(new_body["messages"]) == 4
+
+
+class TestSelectiveCompressionPlumbing:
+    def test_selective_compression_on_by_default_cleans_tool_results(self):
+        dump = "\n".join(["log line %d" % i for i in range(200)] + ["error: boom"])
+        msgs = _long_history(10)
+        msgs.append({"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "t1", "content": dump}
+        ]})
+        body = {"model": "claude-sonnet-5", "messages": msgs}
+        new_body, _ = optimize_body(body, _cfg())
+        kept_tool_result = next(
+            m for m in new_body["messages"]
+            if isinstance(m.get("content"), list)
+            and any(b.get("type") == "tool_result" for b in m["content"])
+        )
+        text = kept_tool_result["content"][0]["content"]
+        assert "tokensnap" in text  # compressed with an omission marker
+        assert len(text) < len(dump)
+
+    def test_selective_compression_off_keeps_tool_result_verbatim(self):
+        dump = "\n".join(["log line %d" % i for i in range(200)] + ["error: boom"])
+        msgs = _long_history(1)
+        msgs.append({"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "t1", "content": dump}
+        ]})
+        body = {"model": "claude-sonnet-5", "messages": msgs}
+        new_body, _ = optimize_body(body, _cfg(selective_compression=False))
+        kept_tool_result = next(
+            m for m in new_body["messages"]
+            if isinstance(m.get("content"), list)
+            and any(b.get("type") == "tool_result" for b in m["content"])
+        )
+        assert kept_tool_result["content"][0]["content"] == dump
+
+    def test_compressor_type_off_disables_truncation_entirely(self):
+        body = {"model": "claude-sonnet-5", "messages": _long_history(20)}
+        new_body, meta = optimize_body(body, _cfg(compressor_type="off", keep_messages=3))
+        assert meta["compressed"] is False
+        assert len(new_body["messages"]) == len(body["messages"])
 
 
 class TestAggressiveThreshold:

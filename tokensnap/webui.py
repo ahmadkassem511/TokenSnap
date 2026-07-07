@@ -3,7 +3,8 @@
 A local, single-page control centre for Tokensnap, served on
 ``http://127.0.0.1:9876``. It's an alternative to the ``tokensnap monitor``
 TUI, adding things a terminal can't do well: historical charts, a first-run
-setup wizard (hardware detection + Ollama model pull), and a settings page.
+setup wizard (compression preset + optional OpenRouter key), and a settings
+page.
 
 It runs as its own aiohttp application (the same web stack the proxy already
 uses - no new dependency, no Flask), completely independent of the proxy: the
@@ -15,25 +16,23 @@ Data sources:
   * historical charts    - ``history.db`` (written by the proxy),
   * live log lines       - ``~/.tokensnap/proxy.log`` (the proxy's own log).
 
-The server binds loopback only and never handles the Anthropic API key.
+The server binds loopback only. It never receives the Anthropic API key, and
+the OpenRouter key it *does* accept (to enable smart Memory Cards) is never
+echoed back to the browser once saved - only whether one is set.
 """
 
-import asyncio
 import json
 import os
-import platform
-import re
 import shutil
 import subprocess
 import sys
 import threading
 import webbrowser
-from pathlib import Path
 from typing import Any, Dict, List
 
 from aiohttp import web
 
-from tokensnap import __version__, history, ollama, stats
+from tokensnap import __version__, history, openrouter, stats
 from tokensnap import config as config_mod
 
 DEFAULT_PORT = 9876
@@ -42,88 +41,14 @@ DEFAULT_PORT = 9876
 # instead of the wizard next time.
 _SETUP_MARKER = config_mod.CONFIG_DIR / ".setup_complete"
 
-# Model names we'll accept for `ollama pull` - passed to a subprocess as an
-# argv element (never a shell), and additionally constrained to the characters
-# a real Ollama tag uses, so a crafted value can't smuggle anything through.
-_MODEL_RE = re.compile(r"^[A-Za-z0-9_.:/-]{1,100}$")
-
 # keep_messages values behind the named presets, shared by the wizard + settings.
-PRESETS: Dict[str, int] = {
-    "simple": 5,
-    "balanced": 10,
-    "complex": 20,
-    "maximum": 999,
+PRESETS: Dict[str, Dict[str, Any]] = {
+    "simple": {"keep_messages": 5, "selective_compression": True, "compressor_type": "regex"},
+    "balanced": {"keep_messages": 10, "selective_compression": True, "compressor_type": "regex"},
+    "complex": {"keep_messages": 20, "selective_compression": False, "compressor_type": "regex"},
+    "smart": {"keep_messages": 25, "selective_compression": True, "compressor_type": "openrouter"},
+    "maximum": {"keep_messages": 999, "selective_compression": True, "compressor_type": "off"},
 }
-
-
-# ---------------------------------------------------------------------------
-# Hardware detection (stdlib only - mirrors the approach used elsewhere)
-# ---------------------------------------------------------------------------
-def _ram_gb() -> float:
-    """Total physical RAM in GB (0.0 if it can't be determined)."""
-    system = platform.system()
-    try:
-        if system == "Windows":
-            import ctypes
-
-            class MEMORYSTATUSEX(ctypes.Structure):
-                _fields_ = [
-                    ("dwLength", ctypes.c_ulong),
-                    ("dwMemoryLoad", ctypes.c_ulong),
-                    ("ullTotalPhys", ctypes.c_ulonglong),
-                    ("ullAvailPhys", ctypes.c_ulonglong),
-                    ("ullTotalPageFile", ctypes.c_ulonglong),
-                    ("ullAvailPageFile", ctypes.c_ulonglong),
-                    ("ullTotalVirtual", ctypes.c_ulonglong),
-                    ("ullAvailVirtual", ctypes.c_ulonglong),
-                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
-                ]
-
-            mem = MEMORYSTATUSEX()
-            mem.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
-            ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(mem))
-            return mem.ullTotalPhys / (1024 ** 3)
-        if system == "Linux":
-            with open("/proc/meminfo") as f:
-                for line in f:
-                    if line.startswith("MemTotal:"):
-                        return int(line.split()[1]) / (1024 * 1024)
-        if system == "Darwin":
-            out = subprocess.run(
-                ["sysctl", "-n", "hw.memsize"],
-                capture_output=True, text=True, timeout=5,
-            )
-            return int(out.stdout.strip()) / (1024 ** 3)
-    except Exception:  # noqa: BLE001 - detection is best-effort
-        pass
-    return 0.0
-
-
-def hardware_info() -> Dict[str, Any]:
-    """Detect CPU cores, RAM, and free disk on the home drive (stdlib only)."""
-    try:
-        disk_free_gb = shutil.disk_usage(str(Path.home())).free / (1024 ** 3)
-    except OSError:
-        disk_free_gb = 0.0
-    return {
-        "os": "%s %s" % (platform.system(), platform.release()),
-        "cpu_cores": os.cpu_count() or 1,
-        "ram_gb": round(_ram_gb(), 1),
-        "disk_free_gb": round(disk_free_gb, 1),
-    }
-
-
-def recommend_model(ram_gb: float) -> str:
-    """Recommend a Qwen model sized to the machine's RAM."""
-    if ram_gb < 8:
-        return "qwen2.5:3b"
-    if ram_gb <= 16:
-        return "qwen2.5:7b"
-    return "qwen2.5:14b"
-
-
-def _valid_model(model: str) -> bool:
-    return bool(_MODEL_RE.match(model or ""))
 
 
 def tail_log(n: int = 200) -> List[str]:
@@ -146,13 +71,16 @@ def mark_setup_complete() -> None:
 
 
 def _public_config() -> Dict[str, Any]:
-    """Config values the settings/setup pages need (never the API key)."""
+    """Config values the settings/setup pages need. The OpenRouter key
+    itself is never sent to the browser once saved - only whether one is
+    set - so it can't leak into page source or browser history."""
     cfg = config_mod.load()
     return {
         "keep_messages": int(cfg["keep_messages"]),
-        "ollama_model": cfg["ollama_model"],
-        "ollama_url": cfg["ollama_url"],
-        "llm_compressor": cfg["llm_compressor"],
+        "selective_compression": bool(cfg["selective_compression"]),
+        "compressor_type": cfg["compressor_type"],
+        "openrouter_model": cfg["openrouter_model"],
+        "openrouter_api_key_set": bool(str(cfg.get("openrouter_api_key", "")).strip()),
     }
 
 
@@ -206,7 +134,8 @@ async def api_stats(request: web.Request) -> web.Response:
         "llm_status": data.get("llm_status") or "not started yet",
         "active_model": active_model,
         "keep_messages": int(cfg["keep_messages"]),
-        "ollama_model": cfg["ollama_model"],
+        "compressor_type": cfg["compressor_type"],
+        "selective_compression": bool(cfg["selective_compression"]),
         "recent": recent_rows,
     })
 
@@ -224,67 +153,6 @@ async def api_log(request: web.Request) -> web.Response:
 
 async def setup_page(request: web.Request) -> web.Response:
     return web.Response(text=_setup_page(), content_type="text/html")
-
-
-async def setup_hardware(request: web.Request) -> web.Response:
-    """Detected specs plus a RAM-sized model recommendation."""
-    hw = hardware_info()
-    hw["recommended_model"] = recommend_model(hw["ram_gb"])
-    return web.json_response(hw)
-
-
-async def setup_pull(request: web.Request) -> web.StreamResponse:
-    """Stream ``ollama pull <model>`` output to the browser as SSE."""
-    model = request.query.get("model", "").strip()
-    resp = web.StreamResponse(
-        headers={
-            "Content-Type": "text/event-stream",
-            "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",
-        }
-    )
-    await resp.prepare(request)
-
-    async def send(line: str) -> None:
-        await resp.write(("data: " + line.replace("\r", "").replace("\n", " ") + "\n\n").encode("utf-8"))
-
-    if not _valid_model(model):
-        await send("ERROR: invalid model name.")
-        await send("[DONE]")
-        await resp.write_eof()
-        return resp
-    if not shutil.which("ollama"):
-        await send("ERROR: 'ollama' is not installed or not on PATH.")
-        await send("Install it from https://ollama.com, then retry.")
-        await send("[DONE]")
-        await resp.write_eof()
-        return resp
-
-    await send("Pulling %s ..." % model)
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            "ollama", "pull", model,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-        )
-        assert proc.stdout is not None
-        while True:
-            raw = await proc.stdout.readline()
-            if not raw:
-                break
-            text = raw.decode("utf-8", "replace").strip()
-            if text:
-                await send(text)
-        await proc.wait()
-        if proc.returncode == 0:
-            await send("Done - %s is ready." % model)
-        else:
-            await send("ERROR: ollama pull exited with code %d." % proc.returncode)
-    except Exception as exc:  # noqa: BLE001
-        await send("ERROR: %s" % exc)
-    await send("[DONE]")
-    await resp.write_eof()
-    return resp
 
 
 async def setup_save(request: web.Request) -> web.Response:
@@ -313,24 +181,36 @@ async def _apply_settings(request: web.Request) -> Dict[str, Any]:
     if not isinstance(body, dict):
         body = {}
 
-    # A named preset is a shortcut for a keep_messages value.
+    # A named preset is a shortcut for keep_messages + compressor settings.
     preset = str(body.get("preset", "")).lower()
     if preset in PRESETS:
-        body.setdefault("keep_messages", PRESETS[preset])
+        for key, value in PRESETS[preset].items():
+            body.setdefault(key, value)
 
     saved: Dict[str, Any] = {}
-    for key in ("keep_messages", "ollama_model", "llm_compressor", "ollama_url"):
+    for key in ("keep_messages", "selective_compression", "compressor_type",
+                "openrouter_model"):
         if key not in body or body[key] in (None, ""):
-            if key == "ollama_model" and body.get(key) == "":
-                pass  # allow clearing the model (switches to regex cards)
-            else:
-                continue
+            continue
         try:
             saved[key] = config_mod.set_value(key, str(body[key]))
         except (KeyError, ValueError):
             continue  # invalid value - skip it rather than 500
-    # A fresh model may now be available; drop Ollama's cached availability probe.
-    ollama.reset_caches()
+
+    # The key is never re-displayed to the browser once saved (see module
+    # docstring), so an empty submission means "leave it alone" - only a
+    # non-empty value, or an explicit clear_key request, changes it. Either
+    # way the response reports only whether a key is now set, never the
+    # value itself.
+    if body.get("clear_key"):
+        config_mod.set_value("openrouter_api_key", "")
+        saved["openrouter_api_key_set"] = False
+    elif str(body.get("openrouter_api_key") or "").strip():
+        config_mod.set_value("openrouter_api_key", str(body["openrouter_api_key"]))
+        saved["openrouter_api_key_set"] = True
+
+    # A key/model may have just changed; drop OpenRouter's cached card results.
+    openrouter.reset_caches()
     return saved
 
 
@@ -383,8 +263,6 @@ def build_app() -> web.Application:
     app.router.add_get("/api/chart", api_chart)
     app.router.add_get("/api/log", api_log)
     app.router.add_get("/setup", setup_page)
-    app.router.add_get("/setup/hardware", setup_hardware)
-    app.router.add_get("/setup/pull", setup_pull)
     app.router.add_post("/setup/save", setup_save)
     app.router.add_get("/settings", settings_page)
     app.router.add_post("/settings/save", settings_save)
@@ -492,7 +370,17 @@ _NAV = (
 )
 
 
-def _shell(title: str, active: str, body: str, extra_head: str = "") -> str:
+def _shell(
+    title: str, active: str, body: str, extra_head: str = "", foot_js: str = ""
+) -> str:
+    """Render the page shell.
+
+    `extra_head` is for content genuinely safe to run before `<body>` exists
+    (e.g. the Chart.js CDN `<script src>`, which only defines a global).
+    `foot_js` is for page-specific inline scripts that touch the page's own
+    DOM (element lookups, event handlers) - these must run after `<main>` is
+    parsed, so they're placed at the end of `<body>`, same as `_COMMON_JS`.
+    """
     tabs = ""
     for href, label in (("/", "Dashboard"), ("/setup", "Setup"), ("/settings", "Settings")):
         cls = " class='active'" if href == active else ""
@@ -503,7 +391,7 @@ def _shell(title: str, active: str, body: str, extra_head: str = "") -> str:
         "<meta name='viewport' content='width=device-width, initial-scale=1'>"
         "<title>" + title + "</title><style>" + _CSS + "</style>" + extra_head +
         "</head><body>" + nav + "<main>" + body + "</main>"
-        "<div id='toast' class='toast'></div>" + _COMMON_JS + "</body></html>"
+        "<div id='toast' class='toast'></div>" + _COMMON_JS + foot_js + "</body></html>"
     )
 
 
@@ -578,8 +466,8 @@ def _dashboard_page() -> str:
   <div class='sub muted' style='margin-top:8px'>Memory Cards: <span id='llm'>-</span></div>
 </div>
 """
-    extra = "<script src='https://cdn.jsdelivr.net/npm/chart.js@4'></script>" + _DASH_JS
-    return _shell("TokenSnap Dashboard", "/", body, extra)
+    head_extra = "<script src='https://cdn.jsdelivr.net/npm/chart.js@4'></script>"
+    return _shell("TokenSnap Dashboard", "/", body, extra_head=head_extra, foot_js=_DASH_JS)
 
 
 _DASH_JS = """
@@ -646,38 +534,42 @@ loadLog();setInterval(loadLog,3000);
 """
 
 
+_PRESET_BUTTONS = """
+<div class='presets'>
+  <button class='btn' data-preset='simple' data-keep='5'>Simple<br><small class='muted'>keep 5</small></button>
+  <button class='btn' data-preset='balanced' data-keep='10'>Balanced<br><small class='muted'>keep 10</small></button>
+  <button class='btn' data-preset='complex' data-keep='20'>Complex<br><small class='muted'>keep 20</small></button>
+  <button class='btn' data-preset='smart' data-keep='25'>Smart<br><small class='muted'>keep 25, OpenRouter</small></button>
+  <button class='btn' data-preset='maximum' data-keep='999'>Maximum<br><small class='muted'>keep all</small></button>
+</div>
+"""
+
+
 def _setup_page() -> str:
     cfg = json.dumps(_public_config())
-    body = """
+    body = ("""
 <div class='panel'>
   <h2 style='font-size:20px'>Welcome to TokenSnap</h2>
-  <p class='muted' style='margin-top:-6px'>Let's get you set up in three quick steps. Memory Cards use a
-     small local model (via Ollama) to summarize old conversation history - all on your machine.</p>
+  <p class='muted' style='margin-top:-6px'>Let's get you set up in two quick steps.</p>
   <div class='steps' style='margin-top:22px'>
 
     <div class='step'><div class='n'>1</div><div class='body'>
-      <h3>Your machine</h3>
-      <div class='hwgrid' id='hwgrid'><div class='hwtile'><div class='k'>Detecting...</div><div class='v'>-</div></div></div>
+      <h3>Smarter Memory Cards (optional)</h3>
+      <p class='muted' style='margin:0 0 8px'>Tokensnap always uses fast rule-based (regex) summarization for
+         older conversation history. For a noticeably better summary, add a free
+         <a href='https://openrouter.ai/keys' target='_blank'>OpenRouter</a> API key - no local install, no cost.
+         Leave this blank to stick with regex-only.</p>
+      <label class='f'>OpenRouter API key</label>
+      <input type='password' id='apikey' placeholder='sk-or-...'>
+      <label class='f'>Model</label>
+      <input type='text' id='model' placeholder='meta-llama/llama-3.1-8b-instruct:free'>
     </div></div>
 
     <div class='step'><div class='n'>2</div><div class='body'>
-      <h3>Pick a local model</h3>
-      <p class='muted' style='margin:0 0 8px'>We recommend a Qwen model sized to your RAM. You can change it.</p>
-      <input type='text' id='model' placeholder='qwen2.5:7b'>
-      <div style='margin-top:10px'><button class='btn' id='pullbtn'>Pull this model with Ollama</button></div>
-      <div class='log' id='pulllog' style='height:150px;margin-top:12px;display:none'></div>
-    </div></div>
-
-    <div class='step'><div class='n'>3</div><div class='body'>
       <h3>Choose a compression preset</h3>
       <p class='muted' style='margin:0 0 8px'>How much recent conversation to keep verbatim before older history
          is summarized. More context = safer for complex work; less = more savings.</p>
-      <div class='presets'>
-        <button class='btn' data-preset='simple' data-keep='5'>Simple<br><small class='muted'>keep 5</small></button>
-        <button class='btn' data-preset='balanced' data-keep='10'>Balanced<br><small class='muted'>keep 10</small></button>
-        <button class='btn' data-preset='complex' data-keep='20'>Complex<br><small class='muted'>keep 20</small></button>
-        <button class='btn' data-preset='maximum' data-keep='999'>Maximum<br><small class='muted'>keep all</small></button>
-      </div>
+      __PRESET_BUTTONS__
       <label class='f'>keep_messages <small>(exchanges kept verbatim)</small></label>
       <input type='number' id='keep' min='1' value='10'>
     </div></div>
@@ -688,42 +580,29 @@ def _setup_page() -> str:
     <a class='btn lg' href='/'>Skip for now</a>
   </div>
 </div>
-<script>window.__CFG__=__CFG__;</script>
-""".replace("__CFG__", cfg)
-    return _shell("TokenSnap Setup", "/setup", body, _SETUP_JS)
+<script>window.__TSNAP_CFG__=@@CFG_JSON@@;</script>
+"""
+        .replace("__PRESET_BUTTONS__", _PRESET_BUTTONS)
+        .replace("@@CFG_JSON@@", cfg)
+    )
+    return _shell("TokenSnap Setup", "/setup", body, foot_js=_SETUP_JS)
 
 
 _SETUP_JS = """
 <script>
-var cfg=window.__CFG__||{};
+var cfg=window.__TSNAP_CFG__||{};
 document.getElementById('keep').value=cfg.keep_messages||10;
-document.getElementById('model').value=cfg.ollama_model||'';
-async function detectHW(){
-  var d=await (await fetch('/setup/hardware')).json();
-  var g=document.getElementById('hwgrid');
-  g.innerHTML='';
-  [['OS',d.os],['CPU cores',d.cpu_cores],['RAM',d.ram_gb+' GB'],['Free disk',d.disk_free_gb+' GB'],
-   ['Recommended',d.recommended_model]].forEach(function(p){
-    g.innerHTML+="<div class='hwtile'><div class='k'>"+p[0]+"</div><div class='v'>"+p[1]+"</div></div>";});
-  if(!document.getElementById('model').value)document.getElementById('model').value=d.recommended_model;
-}
-detectHW();
+document.getElementById('model').value=cfg.openrouter_model||'';
 document.querySelectorAll('.presets button').forEach(function(b){
   b.onclick=function(){document.getElementById('keep').value=b.dataset.keep;
     document.querySelectorAll('.presets button').forEach(function(x){x.style.borderColor='';});
     b.style.borderColor='var(--accent)';};});
-document.getElementById('pullbtn').onclick=function(){
-  var model=document.getElementById('model').value.trim();if(!model){toast('Enter a model name');return;}
-  var box=document.getElementById('pulllog');box.style.display='block';box.textContent='';
-  var es=new EventSource('/setup/pull?model='+encodeURIComponent(model));
-  es.onmessage=function(e){
-    if(e.data==='[DONE]'){es.close();return;}
-    box.textContent+=e.data+'\\n';box.scrollTop=box.scrollHeight;};
-  es.onerror=function(){box.textContent+='\\n(connection closed)';es.close();};
-};
 document.getElementById('finish').onclick=async function(){
-  var payload={ollama_model:document.getElementById('model').value.trim(),
-    keep_messages:parseInt(document.getElementById('keep').value,10)||10};
+  var key=document.getElementById('apikey').value.trim();
+  var payload={keep_messages:parseInt(document.getElementById('keep').value,10)||10,
+    openrouter_model:document.getElementById('model').value.trim(),
+    compressor_type: key ? 'openrouter' : 'regex'};
+  if(key)payload.openrouter_api_key=key;
   await fetch('/setup/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
   toast('Setup saved - opening dashboard');
   setTimeout(function(){location.href='/';},900);
@@ -734,61 +613,79 @@ document.getElementById('finish').onclick=async function(){
 
 def _settings_page() -> str:
     cfg = json.dumps(_public_config())
-    body = """
+    body = ("""
 <div class='panel' style='max-width:640px'>
   <h2 style='font-size:20px'>Settings</h2>
   <p class='muted' style='margin-top:-6px'>Changes are saved immediately and apply to the next request the proxy handles.</p>
 
   <label class='f'>Compression preset</label>
-  <div class='presets'>
-    <button class='btn' data-preset='simple' data-keep='5'>Simple<br><small class='muted'>keep 5</small></button>
-    <button class='btn' data-preset='balanced' data-keep='10'>Balanced<br><small class='muted'>keep 10</small></button>
-    <button class='btn' data-preset='complex' data-keep='20'>Complex<br><small class='muted'>keep 20</small></button>
-    <button class='btn' data-preset='maximum' data-keep='999'>Maximum<br><small class='muted'>keep all</small></button>
-  </div>
+  __PRESET_BUTTONS__
 
   <label class='f'>keep_messages <small>(recent exchanges kept verbatim before summarizing)</small></label>
   <input type='number' id='keep' min='1'>
 
-  <label class='f'>Memory Card generator</label>
-  <select id='llm'>
-    <option value='auto'>auto - use Ollama when available, else regex (recommended)</option>
-    <option value='ollama'>ollama - require Ollama, warn if unreachable</option>
-    <option value='off'>off - regex-only, never call a model</option>
+  <label class='f'>Selective compression <small>(clean noise from every message before truncating - recommended)</small></label>
+  <select id='selective'>
+    <option value='true'>on - assistant messages untouched, terminal dumps/tool output reduced to signal</option>
+    <option value='false'>off - legacy uniform truncation only</option>
   </select>
 
-  <label class='f'>Ollama model</label>
-  <input type='text' id='model' placeholder='qwen2.5:7b'>
+  <label class='f'>Memory Card generator</label>
+  <select id='compressor_type'>
+    <option value='regex'>regex - fast, rule-based, fully offline (default)</option>
+    <option value='openrouter'>openrouter - a free hosted model writes a better summary</option>
+    <option value='off'>off - no Memory Card, no truncation (full history every request)</option>
+  </select>
 
-  <label class='f'>Ollama URL</label>
-  <input type='text' id='url' placeholder='http://127.0.0.1:11434'>
+  <label class='f'>OpenRouter API key <small id='keystatus'></small></label>
+  <input type='password' id='apikey' placeholder='sk-or-... (leave blank to keep the current key)'>
+  <div style='margin-top:8px'><a href='https://openrouter.ai/keys' target='_blank' class='muted'>Get a free key &rarr;</a>
+    &nbsp;|&nbsp; <a href='#' id='clearkey' class='muted'>Clear saved key</a></div>
+
+  <label class='f'>OpenRouter model</label>
+  <input type='text' id='model' placeholder='meta-llama/llama-3.1-8b-instruct:free'>
 
   <div style='margin-top:24px'><button class='btn primary lg' id='save'>Save settings</button></div>
 </div>
-<script>window.__CFG__=__CFG__;</script>
-""".replace("__CFG__", cfg)
-    return _shell("TokenSnap Settings", "/settings", body, _SETTINGS_JS)
+<script>window.__TSNAP_CFG__=@@CFG_JSON@@;</script>
+"""
+        .replace("__PRESET_BUTTONS__", _PRESET_BUTTONS)
+        .replace("@@CFG_JSON@@", cfg)
+    )
+    return _shell("TokenSnap Settings", "/settings", body, foot_js=_SETTINGS_JS)
 
 
 _SETTINGS_JS = """
 <script>
-var cfg=window.__CFG__||{};
+var cfg=window.__TSNAP_CFG__||{};
+var clearKeyRequested=false;
 document.getElementById('keep').value=cfg.keep_messages;
-document.getElementById('model').value=cfg.ollama_model||'';
-document.getElementById('url').value=cfg.ollama_url||'';
-document.getElementById('llm').value=cfg.llm_compressor||'auto';
+document.getElementById('selective').value=cfg.selective_compression?'true':'false';
+document.getElementById('compressor_type').value=cfg.compressor_type||'regex';
+document.getElementById('model').value=cfg.openrouter_model||'';
+document.getElementById('keystatus').textContent=cfg.openrouter_api_key_set?'(a key is set)':'(no key set)';
 document.querySelectorAll('.presets button').forEach(function(b){
   b.onclick=function(){document.getElementById('keep').value=b.dataset.keep;
     document.querySelectorAll('.presets button').forEach(function(x){x.style.borderColor='';});
     b.style.borderColor='var(--accent)';};});
+document.getElementById('clearkey').onclick=function(e){
+  e.preventDefault();clearKeyRequested=true;document.getElementById('apikey').value='';
+  document.getElementById('keystatus').textContent='(will be cleared on save)';
+};
 document.getElementById('save').onclick=async function(){
   var payload={keep_messages:parseInt(document.getElementById('keep').value,10)||10,
-    llm_compressor:document.getElementById('llm').value,
-    ollama_model:document.getElementById('model').value.trim(),
-    ollama_url:document.getElementById('url').value.trim()};
+    selective_compression:document.getElementById('selective').value,
+    compressor_type:document.getElementById('compressor_type').value,
+    openrouter_model:document.getElementById('model').value.trim()};
+  var key=document.getElementById('apikey').value.trim();
+  if(clearKeyRequested)payload.clear_key=true;
+  else if(key)payload.openrouter_api_key=key;
   var r=await (await fetch('/settings/save',{method:'POST',
     headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)})).json();
   toast(r.ok?'Settings saved':'Save failed');
+  clearKeyRequested=false;
+  document.getElementById('keystatus').textContent=(r.saved&&('openrouter_api_key_set' in r.saved))?
+    (r.saved.openrouter_api_key_set?'(a key is set)':'(no key set)'):document.getElementById('keystatus').textContent;
 };
 </script>
 """

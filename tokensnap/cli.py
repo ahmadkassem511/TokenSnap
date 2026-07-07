@@ -392,15 +392,17 @@ def config_show() -> None:
 
 
 _PRESETS = {
-    "simple": {"keep_messages": 5},
-    "balanced": {"keep_messages": 10},
-    "complex": {"keep_messages": 20},
-    "maximum": {"keep_messages": 999},
+    "simple": {"keep_messages": 5, "selective_compression": True, "compressor_type": "regex"},
+    "balanced": {"keep_messages": 10, "selective_compression": True, "compressor_type": "regex"},
+    "complex": {"keep_messages": 20, "selective_compression": False, "compressor_type": "regex"},
+    "smart": {"keep_messages": 25, "selective_compression": True, "compressor_type": "openrouter"},
+    "maximum": {"keep_messages": 999, "selective_compression": True, "compressor_type": "off"},
 }
 _PRESET_HELP = {
     "simple": "quick scripts, single-file tasks",
     "balanced": "the default - suitable for most projects",
-    "complex": "large multi-file projects that need more context",
+    "complex": "large multi-file projects - uniform truncation for maximal safety",
+    "smart": "best quality: selective compression + an OpenRouter model writes the Memory Card",
     "maximum": "effectively disables compression (noise cleaning only)",
 }
 
@@ -408,14 +410,16 @@ _PRESET_HELP = {
 @app.command()
 def preset(
     name: str = typer.Argument(
-        ..., help="simple | balanced | complex | maximum"
+        ..., help="simple | balanced | complex | smart | maximum"
     ),
 ) -> None:
-    """Apply a recommended keep_messages value for your project type.
+    """Apply a recommended configuration for your project type.
 
     More context (higher keep_messages) means Claude keeps more of the
     real conversation and fewer tokens are saved; less context means more
-    savings but a higher risk Claude loses track of complex work.
+    savings but a higher risk Claude loses track of complex work. `smart`
+    additionally turns on selective per-message compression and asks a free
+    OpenRouter model to write the Memory Card for older history.
     """
     name = name.lower()
     if name not in _PRESETS:
@@ -430,6 +434,13 @@ def preset(
         "[green]Applied preset[/green] %r (%s): keep_messages=%d"
         % (name, _PRESET_HELP[name], _PRESETS[name]["keep_messages"])
     )
+    if name == "smart" and not config_mod.load().get("openrouter_api_key"):
+        console.print(
+            "[yellow]Note:[/yellow] no OpenRouter API key is set yet, so Memory "
+            "Cards will fall back to regex until you add one. Get a free key at "
+            "[cyan]https://openrouter.ai/keys[/cyan], then:\n"
+            "  tokensnap config set openrouter_api_key <key>"
+        )
 
 
 @app.command()

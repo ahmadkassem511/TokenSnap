@@ -17,7 +17,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import aiohttp
 from aiohttp import web
 
-from tokensnap import cleaner, compressor, ollama, stats, token_counter
+from tokensnap import cleaner, compressor, stats, token_counter
 from tokensnap.usage import UsageAccumulator
 from tokensnap.utils import transform_message_text
 
@@ -123,20 +123,34 @@ def optimize_body(
     # 1. Clean terminal noise out of every text payload
     messages = _clean_messages(messages)
 
-    # 2. Compress old history into a Memory Card (LLM-assisted when a
-    #    local Ollama server is available; regex otherwise)
-    card, messages = compressor.compress_messages(
-        messages,
-        keep_last_n=int(cfg["keep_messages"]),
-        min_messages=int(cfg["min_messages_to_compress"]),
-        llm_cfg=cfg,
-    )
+    # 2. Compress old history into a Memory Card. Selective compression
+    #    (default) first reduces each message to its signal - assistant
+    #    messages untouched, user terminal dumps and tool results trimmed to
+    #    errors/warnings/status - before truncating; legacy mode skips that
+    #    per-message pass and truncates uniformly, matching pre-0.4 behavior.
+    if bool(cfg.get("selective_compression", True)):
+        card, messages = compressor.build_compressed_context(
+            messages,
+            keep_messages=int(cfg["keep_messages"]),
+            cfg=cfg,
+            min_messages=int(cfg["min_messages_to_compress"]),
+        )
+    else:
+        card, messages = compressor.compress_messages(
+            messages,
+            keep_last_n=int(cfg["keep_messages"]),
+            min_messages=int(cfg["min_messages_to_compress"]),
+            llm_cfg=cfg,
+        )
     if card:
         system = _append_to_system(system, card)
 
     tokens_after = token_counter.count_message_tokens(messages, system)
 
-    # 3. Still near the context window? Get aggressive.
+    # 3. Still near the context window? Get aggressive. This last-resort
+    #    path always uses the uniform legacy truncation (not selective
+    #    compression) - it needs a hard, predictable size cap, which
+    #    per-message compression doesn't guarantee.
     aggressive = False
     if token_counter.near_limit(tokens_after, model, float(cfg["context_threshold"])):
         aggressive = True
@@ -193,7 +207,7 @@ class TokensnapProxy:
             self.cfg["upstream"],
             extra={"markup": True},
         )
-        status = await asyncio.to_thread(ollama.status_reason, self.cfg)
+        status = await asyncio.to_thread(compressor.memory_card_status, self.cfg)
         log.info("Memory Cards: %s", status)
         stats.set_llm_status(status)
 

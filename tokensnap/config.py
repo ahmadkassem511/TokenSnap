@@ -10,6 +10,18 @@ log = logging.getLogger("tokensnap.config")
 CONFIG_DIR = Path.home() / ".tokensnap"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 
+
+def _to_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    s = str(value).strip().lower()
+    if s in ("true", "1", "yes", "on"):
+        return True
+    if s in ("false", "0", "no", "off"):
+        return False
+    raise ValueError("expected a boolean (true/false), got %r" % value)
+
+
 DEFAULTS: Dict[str, Any] = {
     # Proxy listener
     "host": "127.0.0.1",
@@ -27,14 +39,19 @@ DEFAULTS: Dict[str, Any] = {
     "context_threshold": 0.95,
     # Don't compress conversations shorter than this many messages
     "min_messages_to_compress": 8,
-    # Memory Card generator: "auto" uses a local Ollama model when one is
-    # running and silently falls back to regex; "ollama" is the same but
-    # warns when the server is unreachable; "off" is regex-only.
-    "llm_compressor": "auto",
-    "ollama_url": "http://127.0.0.1:11434",
-    "ollama_model": "llama3.2",
-    # Seconds to wait for the local model before falling back to regex
-    "ollama_timeout": 10.0,
+    # Per-message noise reduction (assistant messages passed through
+    # untouched; user terminal dumps and tool results compressed to their
+    # error/warning/status lines) applied before the history is truncated.
+    # When False, the legacy uniform keep_messages truncation is used instead.
+    "selective_compression": True,
+    # Memory Card generator: "openrouter" asks a free OpenRouter model for a
+    # high-quality summary; "regex" uses fast rule-based extraction only;
+    # "off" disables the Memory Card entirely (full history is kept, no
+    # truncation - only per-message noise cleaning still applies).
+    "compressor_type": "regex",
+    # Get a free key at https://openrouter.ai/keys
+    "openrouter_api_key": "",
+    "openrouter_model": "meta-llama/llama-3.1-8b-instruct:free",
     # Optional stored API key (normally unused: the proxy forwards the
     # key Claude Code already sends in request headers)
     "key": "",
@@ -48,12 +65,12 @@ _TYPES = {
     "aggressive_keep_last_n": int,
     "min_messages_to_compress": int,
     "context_threshold": float,
-    "ollama_timeout": float,
+    "selective_compression": _to_bool,
 }
 
 # Keys restricted to a fixed set of values
 _CHOICES = {
-    "llm_compressor": ("auto", "ollama", "off"),
+    "compressor_type": ("openrouter", "regex", "off"),
 }
 
 # Pre-0.3 config key names, kept working so old muscle memory / scripts and
@@ -61,6 +78,10 @@ _CHOICES = {
 _ALIASES = {
     "keep_last_n": "keep_messages",
 }
+
+# Keys from the removed Ollama integration - dropped on load, never migrated
+# to a namesake (there isn't one; OpenRouter has its own model/key concept).
+_REMOVED_KEYS = ("ollama_url", "ollama_model", "ollama_timeout")
 
 
 def resolve_key(key: str) -> str:
@@ -82,6 +103,16 @@ def load() -> Dict[str, Any]:
                 if old in raw:
                     raw.setdefault(new, raw[old])
                     del raw[old]
+            # Pre-0.4 files used `llm_compressor` (Ollama-based: auto/ollama/
+            # off) instead of `compressor_type`. All three old modes safely
+            # map to "regex" - there is no OpenRouter key to carry over, and
+            # "regex" preserves the old truncation behavior exactly (unlike
+            # the new "off", which disables truncation entirely).
+            if "llm_compressor" in raw:
+                raw.setdefault("compressor_type", "regex")
+                del raw["llm_compressor"]
+            for stale in _REMOVED_KEYS:
+                raw.pop(stale, None)
             cfg.update(raw)
         except (json.JSONDecodeError, OSError) as exc:
             log.warning("Could not read %s (%s); using defaults", CONFIG_FILE, exc)

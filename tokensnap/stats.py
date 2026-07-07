@@ -26,8 +26,9 @@ _MAX_RECENT = 50
 
 _EMPTY: Dict[str, Any] = {
     "proxy": {},   # {pid, host, port, started_at}
-    # One-line Memory Card generator status (e.g. "ollama:llama3.2" or
-    # "regex (model 'llama3.2' not pulled)"), refreshed on each proxy start.
+    # One-line Memory Card generator status (e.g. "openrouter:<model>" or
+    # "regex (compressor_type=openrouter but no openrouter_api_key is set)"),
+    # refreshed on each proxy start.
     "llm_status": "",
     "totals": {
         # Tokensnap's own tiktoken estimate of the request body (in/out of

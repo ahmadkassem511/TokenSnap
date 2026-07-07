@@ -2,18 +2,29 @@
 "Memory Card" — a JSON block capturing the task, files touched, decisions
 made, and errors resolved — while keeping the last N exchanges verbatim.
 
-Extraction is rule-based (regex) by default: pure and offline-testable.
-When a config dict is passed via `llm_cfg` and a local Ollama server is
-available, the regex card is upgraded with an LLM-written summary (see
-tokensnap.ollama); regex remains the fallback on any failure.
+Two independent knobs control how aggressive this is:
+
+- `compressor_type` decides how the Memory Card for older history gets
+  written: "regex" (fast, rule-based, offline), "openrouter" (a free
+  hosted model writes a higher-quality card; regex is still the
+  fallback on any failure), or "off" (no card, no truncation at all -
+  the full history is kept, only per-message noise cleaning applies).
+- `selective_compression` decides whether *every* message first goes
+  through per-message noise reduction (see `build_compressed_context`)
+  before the keep_messages cut, or whether the legacy uniform
+  compression (`compress_messages`) is used instead.
+
+Regex extraction is pure and offline-testable; OpenRouter calls (see
+tokensnap.openrouter) run in the same worker thread as the rest of
+request optimization, and never touch the Anthropic API key.
 """
 
 import json
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
-from tokensnap import token_counter
-from tokensnap.utils import is_tool_result_only, message_text
+from tokensnap import cleaner, token_counter
+from tokensnap.utils import is_tool_result_only, message_text, transform_message_text
 
 # File paths worth remembering: something.ext, optionally with directories
 _FILE_RE = re.compile(
@@ -49,9 +60,11 @@ def build_memory_card(
 ) -> Dict[str, Any]:
     """Extract key facts from a list of messages into a compact dict.
 
-    With `llm_cfg` (the Tokensnap config), a local Ollama model is asked
-    for a better summary; its output is merged over the regex card (regex
-    stays the baseline for file paths, which it extracts reliably).
+    With `llm_cfg` (the Tokensnap config) and `compressor_type=="openrouter"`,
+    a free OpenRouter model is asked for a better summary; its output is
+    merged over the regex card (regex stays the baseline for file paths,
+    which it extracts reliably). Any failure - no key, network error,
+    malformed output - silently keeps the regex card.
     """
     files: List[str] = []
     decisions: List[str] = []
@@ -100,9 +113,9 @@ def build_memory_card(
     }
 
     if llm_cfg is not None:
-        from tokensnap import ollama
+        from tokensnap import openrouter
 
-        llm = ollama.try_generate_card(messages, llm_cfg)
+        llm = openrouter.try_generate_card(messages, llm_cfg)
         if llm:
             if llm["task"]:
                 card["task"] = llm["task"]
@@ -116,9 +129,28 @@ def build_memory_card(
                 if path not in merged:
                     merged.append(path)
             card["files_modified"] = merged[:_MAX_FILES]
-            card["generator"] = "ollama:%s" % llm_cfg.get("ollama_model", "?")
+            card["generator"] = "openrouter:%s" % llm_cfg.get("openrouter_model", "?")
 
     return card
+
+
+def memory_card_status(cfg: Dict[str, Any]) -> str:
+    """One-line human status of the Memory Card generator, for the proxy
+    startup log and the stats file (surfaced in `tokensnap status`/`monitor`)."""
+    compressor_type = str(cfg.get("compressor_type", "regex")).lower()
+    if compressor_type == "off":
+        return "off (history kept verbatim up to keep_messages)"
+    if compressor_type == "openrouter":
+        from tokensnap import openrouter
+
+        if not str(cfg.get("openrouter_api_key", "")).strip():
+            return (
+                "regex (compressor_type=openrouter but no openrouter_api_key is "
+                'set - get a free key at https://openrouter.ai/keys, then '
+                "`tokensnap config set openrouter_api_key <key>`)"
+            )
+        return "openrouter:%s" % cfg.get("openrouter_model", openrouter.DEFAULT_MODEL)
+    return "regex"
 
 
 # Converted tool outputs at the cut boundary are truncated to this length
@@ -182,8 +214,13 @@ def compress_messages(
     to the request's `system` prompt by the caller. `keep_last_n` is the
     number of recent exchanges to keep verbatim - the proxy sources this
     from the `keep_messages` config value (see `tokensnap preset`).
+
+    `llm_cfg["compressor_type"] == "off"` disables the Memory Card and the
+    truncation itself: the full history is returned unchanged.
     """
     if not messages or len(messages) <= min_messages:
+        return None, messages
+    if llm_cfg is not None and str(llm_cfg.get("compressor_type", "")).lower() == "off":
         return None, messages
 
     cut = _find_cut_index(messages, keep_last_n)
@@ -208,3 +245,188 @@ def compress_messages(
         json.dumps(card, ensure_ascii=False, separators=(",", ":")),
     )
     return injection, tail
+
+
+# ---------------------------------------------------------------------------
+# Selective per-message compression.
+#
+# Philosophy: eliminate only noise, never substance. Assistant messages -
+# Claude's own reasoning and responses - are never touched, since preserving
+# that reasoning quality is the entire point. User messages are left intact
+# unless they contain a large terminal/log dump, in which case only that
+# dump is reduced to its error/warning/status lines. Tool results are
+# compressed the same way, more aggressively, since they're almost always
+# machine-generated noise once the outcome is known.
+# ---------------------------------------------------------------------------
+
+# A user or tool_result text block bigger than this is a candidate for
+# terminal-dump extraction (spec: ">500 tokens").
+_TERMINAL_DUMP_MIN_TOKENS = 500
+# Tool results are compressed more eagerly - most of their bulk is noise.
+_TOOL_RESULT_MIN_TOKENS = 75
+# How many of the final non-empty lines always survive, as the "status".
+_STATUS_LINES_KEPT = 2
+# Cap on kept error/warning lines - if a dump is nothing but distinct-looking
+# errors (e.g. "error at line N" for 200 different N), keeping "all of them"
+# because none happen to repeat verbatim isn't noise elimination. First+last
+# few are almost always enough to show the pattern.
+_MAX_SIGNAL_LINES = 20
+
+# Shell-prompt-ish and error/warning line markers used to recognize a
+# terminal dump versus ordinary prose.
+_PROMPT_RE = re.compile(
+    r"(?m)^(?:\$\s|>\s|#\s|PS [A-Za-z]:\\.*>|[\w.\-]+@[\w.\-]+:.*[$#]\s)"
+)
+_SIGNAL_RE = re.compile(
+    r"(?i)\b(error|exception|traceback|warning|warn|failed|failure|fatal|"
+    r"npm (?:warn|err!))\b"
+)
+_FAIL_RE = re.compile(r"(?i)\b(fail(?:ed|ure)?|error|exception)\b")
+
+
+def _looks_like_terminal_dump(text: str) -> bool:
+    """Heuristic: long text that reads like shell/CLI output rather than
+    prose - either it has shell-prompt-style lines, or it's dense with
+    error/warning signal words."""
+    if token_counter.count_tokens(text) <= _TERMINAL_DUMP_MIN_TOKENS:
+        return False
+    return bool(_PROMPT_RE.search(text) or _SIGNAL_RE.search(text))
+
+
+def _extract_signal_lines(text: str) -> str:
+    """Clean ANSI/progress-bar/dedup noise, then keep only lines carrying
+    real information: errors, warnings, and the final status line(s).
+    Everything else becomes a one-line summary of what was omitted.
+    """
+    cleaned, _ = cleaner.clean_text(text)
+    non_empty = [l for l in cleaned.split("\n") if l.strip()]
+    if not non_empty:
+        return "[tokensnap: empty output]"
+
+    # Index-based selection (not value-based) so a line that repeats
+    # verbatim at several positions is judged, and counted, independently
+    # each time - matching by line content would either drop all but one
+    # copy or resurrect every copy of a merely-common line.
+    tail_start = max(0, len(non_empty) - _STATUS_LINES_KEPT)
+    signal_indices = [i for i, l in enumerate(non_empty) if _SIGNAL_RE.search(l)]
+    # Count every signal line for the summary even if the cap below trims
+    # which ones are actually shown.
+    n_errors = sum(1 for i in signal_indices if _FAIL_RE.search(non_empty[i]))
+    n_warnings = len(signal_indices) - n_errors
+    if len(signal_indices) > _MAX_SIGNAL_LINES:
+        half = _MAX_SIGNAL_LINES // 2
+        signal_indices = signal_indices[:half] + signal_indices[-half:]
+
+    kept_indices = sorted(set(signal_indices) | set(range(tail_start, len(non_empty))))
+    kept = [non_empty[i] for i in kept_indices]
+    omitted = len(non_empty) - len(kept)
+
+    if not kept:
+        return "[tokensnap: %d lines of output cleaned - no errors or warnings detected]" % len(
+            non_empty
+        )
+
+    summary = "\n".join(kept)
+    if omitted > 0:
+        summary += "\n[tokensnap: %d lines omitted (%d error%s, %d warning%s)]" % (
+            omitted,
+            n_errors,
+            "" if n_errors == 1 else "s",
+            n_warnings,
+            "" if n_warnings == 1 else "s",
+        )
+    return summary
+
+
+def _compress_user_text(text: str) -> str:
+    """Leave prose alone; reduce only paragraphs that look like a large
+    terminal dump, preserving any surrounding natural-language text."""
+    if not _looks_like_terminal_dump(text):
+        return text
+    # Split on blank lines so a "please check this:\n\n<dump>\n\nthoughts?"
+    # message keeps its prose paragraphs intact and only the dump shrinks.
+    paragraphs = re.split(r"\n\s*\n", text)
+    out = []
+    for para in paragraphs:
+        if _looks_like_terminal_dump(para):
+            out.append(_extract_signal_lines(para))
+        else:
+            out.append(para)
+    return "\n\n".join(out)
+
+
+def _compress_tool_result_text(text: str) -> str:
+    """Tool results are compressed unconditionally once they're non-trivial
+    in size - almost none of a large tool output is worth its tokens once
+    the errors/warnings/final status are captured."""
+    if token_counter.count_tokens(text) <= _TOOL_RESULT_MIN_TOKENS:
+        return text
+    return _extract_signal_lines(text)
+
+
+def _compress_message_selectively(message: Dict[str, Any]) -> Dict[str, Any]:
+    """Apply the selective-compression philosophy to one message:
+    assistant messages pass through untouched; user text is scanned for
+    terminal dumps; tool_result content is compressed aggressively."""
+    role = message.get("role")
+    if role == "assistant":
+        return message
+
+    content = message.get("content")
+
+    if isinstance(content, str):
+        # A plain string message: only "user" messages reach here with a
+        # bare string (tool_result content always lives in blocks), so the
+        # gentler user-text heuristic applies.
+        return transform_message_text(message, _compress_user_text)
+
+    if isinstance(content, list):
+        new_blocks = []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "tool_result":
+                block = dict(
+                    block,
+                    content=_transform_tool_result_content(block.get("content")),
+                )
+            elif isinstance(block, dict) and block.get("type") == "text":
+                block = dict(block, text=_compress_user_text(block.get("text", "")))
+            new_blocks.append(block)
+        return dict(message, content=new_blocks)
+
+    return message
+
+
+def _transform_tool_result_content(content: Any) -> Any:
+    if isinstance(content, str):
+        return _compress_tool_result_text(content)
+    if isinstance(content, list):
+        new_blocks = []
+        for block in content:
+            if isinstance(block, dict) and isinstance(block.get("text"), str):
+                block = dict(block, text=_compress_tool_result_text(block["text"]))
+            new_blocks.append(block)
+        return new_blocks
+    return content
+
+
+def build_compressed_context(
+    messages: List[Dict[str, Any]],
+    keep_messages: int = 10,
+    cfg: Optional[Dict[str, Any]] = None,
+    min_messages: int = 8,
+) -> Tuple[Optional[str], List[Dict[str, Any]]]:
+    """Selective-compression entry point: apply per-message noise reduction
+    to the whole history, then truncate the older part into a Memory Card
+    exactly like `compress_messages` (same safe cut-point / tool-pairing
+    guarantees), unless `compressor_type=="off"`.
+
+    Returns (memory_card_text_or_None, processed_messages).
+    """
+    cfg = cfg or {}
+    messages = [_compress_message_selectively(m) for m in messages]
+    return compress_messages(
+        messages,
+        keep_last_n=keep_messages,
+        min_messages=min_messages,
+        llm_cfg=cfg,
+    )
