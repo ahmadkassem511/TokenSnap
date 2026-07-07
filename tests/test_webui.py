@@ -192,7 +192,15 @@ class TestLaunchClaudeTerminal:
     def test_starts_proxy_if_not_running(self, tmp_path, monkeypatch):
         monkeypatch.setattr(webui.config_mod, "CONFIG_DIR", tmp_path)
         monkeypatch.setattr(webui.config_mod, "CONFIG_FILE", tmp_path / "config.json")
-        monkeypatch.setattr(webui.shutil, "which", lambda name: "/usr/bin/claude" if name == "claude" else None)
+        # "claude" must resolve for the install check to pass; on non-Windows
+        # CI runners (no real terminal emulator installed), the Linux
+        # terminal-detection loop also needs at least one hit so the test
+        # exercises success regardless of which platform branch runs.
+        known_terminals = {"claude", "x-terminal-emulator", "gnome-terminal", "konsole", "xterm"}
+        monkeypatch.setattr(
+            webui.shutil, "which",
+            lambda name: ("/usr/bin/" + name) if name in known_terminals else None,
+        )
         monkeypatch.setattr(webui.stats, "proxy_running", lambda *a, **k: False)
         started = {"called": False}
 
