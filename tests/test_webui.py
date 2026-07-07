@@ -6,6 +6,7 @@ and log path are bound to config_mod.CONFIG_DIR at import time, so tests
 monkeypatch the already-resolved module attributes.
 """
 
+import asyncio
 import json
 import re
 
@@ -43,6 +44,16 @@ class TestBuildApp:
         for expected in ("/", "/setup", "/settings", "/api/stats", "/api/chart", "/api/log"):
             assert expected in paths
 
+    def test_registers_openrouter_status_route(self):
+        app = webui.build_app()
+        paths = {r.resource.canonical for r in app.router.routes()}
+        assert "/api/openrouter-status" in paths
+
+    def test_registers_launch_route(self):
+        app = webui.build_app()
+        paths = {r.resource.canonical for r in app.router.routes()}
+        assert "/launch" in paths
+
     def test_ollama_routes_removed(self):
         # The Ollama pull/hardware-detection endpoints no longer exist.
         app = webui.build_app()
@@ -79,6 +90,134 @@ class TestPublicConfig:
         cfg = webui._public_config()
         assert cfg["compressor_type"] == "openrouter"
         assert cfg["selective_compression"] is False
+
+    def test_reports_fallback_models(self):
+        from tokensnap import config as config_mod
+
+        config_mod.set_value("openrouter_fallback_models", "model-a, model-b")
+        cfg = webui._public_config()
+        assert cfg["openrouter_fallback_models"] == ["model-a", "model-b"]
+
+    def test_default_fallback_models_is_empty_list(self):
+        cfg = webui._public_config()
+        assert cfg["openrouter_fallback_models"] == []
+
+
+class TestApiStatsOpenRouterFields:
+    """Regression test: the dashboard's Memory Cards pill used to turn green
+    whenever compressor_type=="openrouter", even with no API key configured
+    (i.e. OpenRouter isn't actually doing anything - it's silently falling
+    back to regex). The fix requires api_stats() to expose whether a key is
+    actually set, not just which mode is selected."""
+
+    @pytest.fixture(autouse=True)
+    def isolated(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(webui.config_mod, "CONFIG_DIR", tmp_path)
+        monkeypatch.setattr(webui.config_mod, "CONFIG_FILE", tmp_path / "config.json")
+        monkeypatch.setattr(webui.stats, "STATS_DIR", tmp_path)
+        monkeypatch.setattr(webui.stats, "STATS_FILE", tmp_path / "stats.json")
+        yield
+
+    def _stats_json(self):
+        response = asyncio.run(webui.api_stats(None))
+        return json.loads(response.text)
+
+    def test_reports_key_set_true(self):
+        from tokensnap import config as config_mod
+
+        config_mod.set_value("compressor_type", "openrouter")
+        config_mod.set_value("openrouter_api_key", "sk-or-test")
+        data = self._stats_json()
+        assert data["compressor_type"] == "openrouter"
+        assert data["openrouter_api_key_set"] is True
+
+    def test_reports_key_set_false_when_openrouter_selected_but_no_key(self):
+        from tokensnap import config as config_mod
+
+        config_mod.set_value("compressor_type", "openrouter")
+        data = self._stats_json()
+        assert data["compressor_type"] == "openrouter"
+        assert data["openrouter_api_key_set"] is False
+
+    def test_never_exposes_the_raw_key_value(self):
+        from tokensnap import config as config_mod
+
+        config_mod.set_value("openrouter_api_key", "sk-or-super-secret")
+        response = asyncio.run(webui.api_stats(None))
+        assert "sk-or-super-secret" not in response.text
+
+
+class TestApplySettingsFallbackModels:
+    @pytest.fixture(autouse=True)
+    def isolated_config(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(webui.config_mod, "CONFIG_DIR", tmp_path)
+        monkeypatch.setattr(webui.config_mod, "CONFIG_FILE", tmp_path / "config.json")
+        yield
+
+    def _apply(self, payload):
+        class FakeRequest:
+            async def json(self_inner):
+                return payload
+
+        return asyncio.run(webui._apply_settings(FakeRequest()))
+
+    def test_saves_comma_separated_fallback_models(self):
+        from tokensnap import config as config_mod
+
+        self._apply({"openrouter_fallback_models": "a, b, c"})
+        assert config_mod.load()["openrouter_fallback_models"] == ["a", "b", "c"]
+
+    def test_explicit_empty_string_clears_fallback_models(self):
+        from tokensnap import config as config_mod
+
+        config_mod.set_value("openrouter_fallback_models", "a, b")
+        self._apply({"openrouter_fallback_models": ""})
+        assert config_mod.load()["openrouter_fallback_models"] == []
+
+    def test_absent_key_leaves_fallback_models_untouched(self):
+        from tokensnap import config as config_mod
+
+        config_mod.set_value("openrouter_fallback_models", "a, b")
+        self._apply({"keep_messages": 15})
+        assert config_mod.load()["openrouter_fallback_models"] == ["a", "b"]
+
+
+class TestLaunchClaudeTerminal:
+    def test_claude_not_installed_returns_install_hint(self, monkeypatch):
+        monkeypatch.setattr(webui.shutil, "which", lambda name: None)
+        ok, message = webui._launch_claude_terminal()
+        assert ok is False
+        assert "claude.ai/download" in message or "npm install" in message
+
+    def test_starts_proxy_if_not_running(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(webui.config_mod, "CONFIG_DIR", tmp_path)
+        monkeypatch.setattr(webui.config_mod, "CONFIG_FILE", tmp_path / "config.json")
+        monkeypatch.setattr(webui.shutil, "which", lambda name: "/usr/bin/claude" if name == "claude" else None)
+        monkeypatch.setattr(webui.stats, "proxy_running", lambda *a, **k: False)
+        started = {"called": False}
+
+        def fake_start_proxy_detached():
+            started["called"] = True
+            return True, tmp_path / "proxy.log"
+
+        monkeypatch.setattr(webui.stats, "start_proxy_detached", fake_start_proxy_detached)
+        monkeypatch.setattr(webui.subprocess, "Popen", lambda *a, **k: None)
+        ok, message = webui._launch_claude_terminal()
+        assert started.get("called") is True
+        assert ok is True
+        assert "Claude Code launched" in message
+
+    def test_proxy_start_failure_is_reported(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(webui.config_mod, "CONFIG_DIR", tmp_path)
+        monkeypatch.setattr(webui.config_mod, "CONFIG_FILE", tmp_path / "config.json")
+        monkeypatch.setattr(webui.shutil, "which", lambda name: "/usr/bin/claude" if name == "claude" else None)
+        monkeypatch.setattr(webui.stats, "proxy_running", lambda *a, **k: False)
+        monkeypatch.setattr(
+            webui.stats, "start_proxy_detached", lambda: (False, tmp_path / "proxy.log")
+        )
+        ok, message = webui._launch_claude_terminal()
+        assert ok is False
+        assert "proxy" in message.lower()
 
 
 class TestPageRendering:
@@ -187,3 +326,24 @@ class TestPageRendering:
     def test_setup_page_offers_smart_preset(self):
         html = webui._setup_page()
         assert "data-preset='smart'" in html
+
+    def test_setup_page_has_launch_claude_button(self):
+        html = webui._setup_page()
+        assert "id='launchClaudeBtn'" in html
+        assert "Launch Claude Code" in html
+
+    def test_settings_page_has_launch_claude_button(self):
+        html = webui._settings_page()
+        assert "id='launchClaudeBtn'" in html
+        assert "Launch Claude Code with current settings" in html
+
+    def test_settings_page_has_fallback_models_field(self):
+        html = webui._settings_page()
+        assert "id='fallback'" in html
+
+    def test_launch_buttons_appear_before_their_script(self):
+        for page_fn in (webui._setup_page, webui._settings_page):
+            html = page_fn()
+            btn_pos = html.index("id='launchClaudeBtn'")
+            script_pos = html.rindex("<script>")
+            assert btn_pos < script_pos

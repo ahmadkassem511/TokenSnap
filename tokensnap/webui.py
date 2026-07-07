@@ -80,6 +80,7 @@ def _public_config() -> Dict[str, Any]:
         "selective_compression": bool(cfg["selective_compression"]),
         "compressor_type": cfg["compressor_type"],
         "openrouter_model": cfg["openrouter_model"],
+        "openrouter_fallback_models": list(cfg.get("openrouter_fallback_models") or []),
         "openrouter_api_key_set": bool(str(cfg.get("openrouter_api_key", "")).strip()),
     }
 
@@ -136,6 +137,7 @@ async def api_stats(request: web.Request) -> web.Response:
         "keep_messages": int(cfg["keep_messages"]),
         "compressor_type": cfg["compressor_type"],
         "selective_compression": bool(cfg["selective_compression"]),
+        "openrouter_api_key_set": bool(str(cfg.get("openrouter_api_key", "")).strip()),
         "recent": recent_rows,
     })
 
@@ -149,6 +151,23 @@ async def api_chart(request: web.Request) -> web.Response:
 async def api_log(request: web.Request) -> web.Response:
     """The tail of the proxy log, for the live log panel."""
     return web.json_response({"lines": tail_log(200)})
+
+
+async def api_openrouter_status(request: web.Request) -> web.Response:
+    """OpenRouter model/fallback/rate-limit status, for the Settings page
+    and the Dashboard's Memory Cards indicator."""
+    cfg = config_mod.load()
+    snap = openrouter.status_snapshot()
+    return web.json_response({
+        "primary_model": cfg.get("openrouter_model"),
+        "fallback_models": list(cfg.get("openrouter_fallback_models") or []),
+        "rate_limit_remaining": snap["rate_limit_remaining"],
+        "rate_limit_reset": snap["rate_limit_reset"],
+        "fallback_active": snap["fallback_active"],
+        "in_cooldown": snap["in_cooldown"],
+        "cooldown_seconds_left": snap["cooldown_seconds_left"],
+        "recent_errors": snap["recent_errors"],
+    })
 
 
 async def setup_page(request: web.Request) -> web.Response:
@@ -197,6 +216,16 @@ async def _apply_settings(request: web.Request) -> Dict[str, Any]:
         except (KeyError, ValueError):
             continue  # invalid value - skip it rather than 500
 
+    # openrouter_fallback_models: unlike the keys above, an explicit "" is a
+    # meaningful value here (clear the fallback list), not "leave unchanged".
+    if "openrouter_fallback_models" in body and body["openrouter_fallback_models"] is not None:
+        try:
+            saved["openrouter_fallback_models"] = config_mod.set_value(
+                "openrouter_fallback_models", str(body["openrouter_fallback_models"])
+            )
+        except (KeyError, ValueError):
+            pass
+
     # The key is never re-displayed to the browser once saved (see module
     # docstring), so an empty submission means "leave it alone" - only a
     # non-empty value, or an explicit clear_key request, changes it. Either
@@ -215,17 +244,45 @@ async def _apply_settings(request: web.Request) -> Dict[str, Any]:
 
 
 async def launch(request: web.Request) -> web.Response:
-    """Open a new terminal running ``tokensnap run claude`` (starts the proxy)."""
+    """Ensure the proxy is running and open a new terminal with Claude Code
+    pointed at it. Called by the "Launch Claude Code" buttons on the setup
+    wizard and Settings page."""
     ok, message = _launch_claude_terminal()
     return web.json_response({"ok": ok, "message": message})
 
 
-def _launch_claude_terminal() -> "tuple[bool, str]":
-    """Spawn a new OS terminal that runs ``tokensnap run claude``.
+_CLAUDE_INSTALL_HINT = (
+    "Claude Code isn't installed (or not on PATH). Install it from "
+    "https://claude.ai/download, or run: npm install -g @anthropic-ai/claude-code"
+)
 
-    Uses ``python -m tokensnap`` (always resolvable) so it works whether or not
-    the ``tokensnap`` console script is on PATH. Returns (ok, human message).
+
+def _proxy_host_port() -> "tuple[str, int]":
+    cfg = config_mod.load()
+    return cfg["host"], int(cfg["port"])
+
+
+def _launch_claude_terminal() -> "tuple[bool, str]":
+    """Start the proxy (if needed) and open a new OS terminal running
+    ``tokensnap run claude`` - which itself sets ANTHROPIC_BASE_URL and
+    launches Claude Code once the proxy is confirmed up.
+
+    Uses ``python -m tokensnap`` (always resolvable) so it works whether or
+    not the ``tokensnap`` console script is on PATH. Returns (ok, message);
+    `message` is shown as both a toast and a persistent on-page result.
     """
+    if not shutil.which("claude"):
+        return False, _CLAUDE_INSTALL_HINT
+
+    if not stats.proxy_running(*_proxy_host_port()):
+        ok, log_path = stats.start_proxy_detached()
+        if not ok:
+            return False, "Couldn't start the Tokensnap proxy. See log: %s" % log_path
+
+    success_message = (
+        "Claude Code launched! A new terminal window should have opened. "
+        "You can close this browser tab or keep it open to monitor savings."
+    )
     py = sys.executable
     inner = '"%s" -m tokensnap run claude' % py
     try:
@@ -233,17 +290,17 @@ def _launch_claude_terminal() -> "tuple[bool, str]":
             subprocess.Popen(
                 'start "TokenSnap - Claude Code" cmd /k %s' % inner, shell=True
             )
-            return True, "Launched Claude Code in a new terminal window."
+            return True, success_message
         if sys.platform == "darwin":
             subprocess.Popen(
                 ["osascript", "-e",
                  'tell application "Terminal" to do script "%s"' % inner]
             )
-            return True, "Launched Claude Code in a new Terminal window."
+            return True, success_message
         for term in ("x-terminal-emulator", "gnome-terminal", "konsole", "xterm"):
             if shutil.which(term):
                 subprocess.Popen([term, "-e", "sh", "-c", inner])
-                return True, "Launched Claude Code in a new terminal window."
+                return True, success_message
         return False, (
             "Couldn't find a terminal to open. Run this yourself: "
             "tokensnap run claude"
@@ -262,6 +319,7 @@ def build_app() -> web.Application:
     app.router.add_get("/api/stats", api_stats)
     app.router.add_get("/api/chart", api_chart)
     app.router.add_get("/api/log", api_log)
+    app.router.add_get("/api/openrouter-status", api_openrouter_status)
     app.router.add_get("/setup", setup_page)
     app.router.add_post("/setup/save", setup_save)
     app.router.add_get("/settings", settings_page)
@@ -309,6 +367,8 @@ nav.tabs a.active{background:var(--panel2);color:var(--text)}
 .pill.on .dot{background:var(--accent);box-shadow:0 0 10px var(--accent)}
 .pill.off{color:var(--danger);border-color:rgba(248,81,73,.4)}
 .pill.off .dot{background:var(--danger)}
+.pill.warn{color:var(--warn);border-color:rgba(210,153,34,.4)}
+.pill.warn .dot{background:var(--warn)}
 main{max-width:1180px;margin:0 auto;padding:28px}
 .grid{display:grid;gap:18px}
 .cards{grid-template-columns:repeat(auto-fit,minmax(200px,1fr))}
@@ -463,7 +523,11 @@ def _dashboard_page() -> str:
     <button class='btn primary' id='launchbtn' style='margin-left:auto'>Launch Claude Code</button>
   </div>
   <div class='log' id='log' style='margin-top:12px'>waiting for the proxy...</div>
-  <div class='sub muted' style='margin-top:8px'>Memory Cards: <span id='llm'>-</span></div>
+  <div class='sub muted' style='margin-top:8px'>Memory Cards:
+    <span id='llmpill' class='pill' style='padding:2px 9px;font-size:11px;margin-left:4px'>
+      <span class='dot'></span><span id='llm'>-</span>
+    </span>
+  </div>
 </div>
 """
     head_extra = "<script src='https://cdn.jsdelivr.net/npm/chart.js@4'></script>"
@@ -472,8 +536,23 @@ def _dashboard_page() -> str:
 
 _DASH_JS = """
 <script>
-var chart, period='day';
+var chart, period='day', orStatus={fallback_active:false,in_cooldown:false};
 function esc(s){return String(s).replace(/[&<>]/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;'}[c];});}
+function updateLLMPill(compressorType, keySet){
+  var pill=document.getElementById('llmpill');
+  // Not selected, or selected but no key configured yet: neutral, not a
+  // healthy "on" state - OpenRouter isn't actually doing anything either way.
+  if(compressorType!=='openrouter'||!keySet){pill.className='pill';return;}
+  if(orStatus.in_cooldown){pill.className='pill off';return;}
+  if(orStatus.fallback_active){pill.className='pill warn';return;}
+  pill.className='pill on';
+}
+async function loadORStatus(){
+  try{orStatus=await (await fetch('/api/openrouter-status')).json();
+    var s=window.__STATS__||{};
+    updateLLMPill(s.compressor_type, s.openrouter_api_key_set);}
+  catch(e){}
+}
 window.onStats=function(s){
   document.getElementById('c_saved').textContent=fmt(s.tokens_saved);
   document.getElementById('c_pct').textContent=(s.pct||0)+'%';
@@ -482,6 +561,7 @@ window.onStats=function(s){
   document.getElementById('c_model').textContent=s.active_model||'-';
   document.getElementById('c_keep').textContent=s.keep_messages;
   document.getElementById('llm').textContent=s.llm_status;
+  updateLLMPill(s.compressor_type, s.openrouter_api_key_set);
   renderRecent(s.recent||[]);
 };
 function renderRecent(rows){
@@ -530,6 +610,7 @@ document.getElementById('launchbtn').onclick=async function(){
 };
 setTimeout(loadChart,300);setInterval(loadChart,15000);
 loadLog();setInterval(loadLog,3000);
+loadORStatus();setInterval(loadORStatus,10000);
 </script>
 """
 
@@ -575,9 +656,16 @@ def _setup_page() -> str:
     </div></div>
   </div>
 
-  <div style='display:flex;gap:12px;margin-top:26px'>
+  <div id='finishArea' style='display:flex;gap:12px;margin-top:26px'>
     <button class='btn primary lg' id='finish'>Finish setup &rarr;</button>
     <a class='btn lg' href='/'>Skip for now</a>
+  </div>
+
+  <div id='launchArea' style='display:none;margin-top:26px;text-align:center'>
+    <p class='muted' style='margin-bottom:14px'>Setup saved. Ready to go.</p>
+    <button class='btn primary lg' id='launchClaudeBtn'>&#128640; Launch Claude Code with these settings</button>
+    <div id='launchResult' class='sub' style='margin-top:14px'></div>
+    <div style='margin-top:14px'><a href='/'>Go to dashboard &rarr;</a></div>
   </div>
 </div>
 <script>window.__TSNAP_CFG__=@@CFG_JSON@@;</script>
@@ -604,8 +692,23 @@ document.getElementById('finish').onclick=async function(){
     compressor_type: key ? 'openrouter' : 'regex'};
   if(key)payload.openrouter_api_key=key;
   await fetch('/setup/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
-  toast('Setup saved - opening dashboard');
-  setTimeout(function(){location.href='/';},900);
+  toast('Setup saved');
+  document.getElementById('finishArea').style.display='none';
+  document.getElementById('launchArea').style.display='block';
+};
+document.getElementById('launchClaudeBtn').onclick=async function(){
+  var self=this, resultEl=document.getElementById('launchResult');
+  self.disabled=true;
+  try{
+    var r=await (await fetch('/launch',{method:'POST'})).json();
+    resultEl.textContent=r.message||'Launched';
+    resultEl.style.color=r.ok?'var(--accent)':'var(--danger)';
+    toast(r.ok?'Launched!':'Launch failed');
+  }catch(e){
+    resultEl.textContent='Launch failed: '+e;
+    resultEl.style.color='var(--danger)';
+  }
+  self.disabled=false;
 };
 </script>
 """
@@ -645,7 +748,20 @@ def _settings_page() -> str:
   <label class='f'>OpenRouter model</label>
   <input type='text' id='model' placeholder='meta-llama/llama-3.1-8b-instruct:free'>
 
-  <div style='margin-top:24px'><button class='btn primary lg' id='save'>Save settings</button></div>
+  <label class='f'>Fallback models <small>(comma-separated - tried in order if the model above hits a rate limit or is down)</small></label>
+  <input type='text' id='fallback' placeholder='e.g. qwen/qwen-2.5-7b-instruct:free, mistralai/mistral-7b-instruct:free'>
+
+  <div class='panel' style='margin-top:18px;padding:14px 18px'>
+    <div style='font-size:12.5px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;margin-bottom:8px'>
+      OpenRouter status</div>
+    <div id='orstatus' class='sub'>Loading...</div>
+  </div>
+
+  <div style='display:flex;gap:12px;margin-top:24px;flex-wrap:wrap'>
+    <button class='btn primary lg' id='save'>Save settings</button>
+    <button class='btn lg' id='launchClaudeBtn'>&#128640; Launch Claude Code with current settings</button>
+  </div>
+  <div id='launchResult' class='sub' style='margin-top:12px'></div>
 </div>
 <script>window.__TSNAP_CFG__=@@CFG_JSON@@;</script>
 """
@@ -663,6 +779,7 @@ document.getElementById('keep').value=cfg.keep_messages;
 document.getElementById('selective').value=cfg.selective_compression?'true':'false';
 document.getElementById('compressor_type').value=cfg.compressor_type||'regex';
 document.getElementById('model').value=cfg.openrouter_model||'';
+document.getElementById('fallback').value=(cfg.openrouter_fallback_models||[]).join(', ');
 document.getElementById('keystatus').textContent=cfg.openrouter_api_key_set?'(a key is set)':'(no key set)';
 document.querySelectorAll('.presets button').forEach(function(b){
   b.onclick=function(){document.getElementById('keep').value=b.dataset.keep;
@@ -672,11 +789,31 @@ document.getElementById('clearkey').onclick=function(e){
   e.preventDefault();clearKeyRequested=true;document.getElementById('apikey').value='';
   document.getElementById('keystatus').textContent='(will be cleared on save)';
 };
+async function loadORStatus(){
+  var el=document.getElementById('orstatus');
+  try{
+    var s=await (await fetch('/api/openrouter-status')).json();
+    var lines=[];
+    lines.push('Primary: <b>'+(s.primary_model||'-')+'</b>');
+    lines.push('Fallbacks: '+((s.fallback_models&&s.fallback_models.length)?s.fallback_models.join(', '):'(none)'));
+    lines.push('Rate limit remaining: '+(s.rate_limit_remaining==null?'unknown':s.rate_limit_remaining));
+    lines.push('Rate limit reset: '+(s.rate_limit_reset==null?'unknown':s.rate_limit_reset));
+    if(s.in_cooldown)lines.push("<span style='color:var(--danger)'>In cooldown for "+s.cooldown_seconds_left+"s (all models recently failed)</span>");
+    else if(s.fallback_active)lines.push("<span style='color:var(--warn)'>Fallback mode active</span>");
+    if(s.recent_errors&&s.recent_errors.length){
+      lines.push('Recent errors:');
+      s.recent_errors.slice(-3).forEach(function(e){lines.push('&nbsp;&nbsp;'+e.model+': '+e.error);});
+    }
+    el.innerHTML=lines.join('<br>');
+  }catch(e){el.textContent='Unavailable';}
+}
+loadORStatus();setInterval(loadORStatus,10000);
 document.getElementById('save').onclick=async function(){
   var payload={keep_messages:parseInt(document.getElementById('keep').value,10)||10,
     selective_compression:document.getElementById('selective').value,
     compressor_type:document.getElementById('compressor_type').value,
-    openrouter_model:document.getElementById('model').value.trim()};
+    openrouter_model:document.getElementById('model').value.trim(),
+    openrouter_fallback_models:document.getElementById('fallback').value.trim()};
   var key=document.getElementById('apikey').value.trim();
   if(clearKeyRequested)payload.clear_key=true;
   else if(key)payload.openrouter_api_key=key;
@@ -686,6 +823,21 @@ document.getElementById('save').onclick=async function(){
   clearKeyRequested=false;
   document.getElementById('keystatus').textContent=(r.saved&&('openrouter_api_key_set' in r.saved))?
     (r.saved.openrouter_api_key_set?'(a key is set)':'(no key set)'):document.getElementById('keystatus').textContent;
+  loadORStatus();
+};
+document.getElementById('launchClaudeBtn').onclick=async function(){
+  var self=this, resultEl=document.getElementById('launchResult');
+  self.disabled=true;
+  try{
+    var r=await (await fetch('/launch',{method:'POST'})).json();
+    resultEl.textContent=r.message||'Launched';
+    resultEl.style.color=r.ok?'var(--accent)':'var(--danger)';
+    toast(r.ok?'Launched!':'Launch failed');
+  }catch(e){
+    resultEl.textContent='Launch failed: '+e;
+    resultEl.style.color='var(--danger)';
+  }
+  self.disabled=false;
 };
 </script>
 """

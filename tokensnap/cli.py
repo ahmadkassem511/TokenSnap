@@ -443,6 +443,46 @@ def preset(
         )
 
 
+@app.command(name="openrouter-status")
+def openrouter_status() -> None:
+    """Show the OpenRouter model, fallback list, rate limit, and recent errors."""
+    from tokensnap import openrouter
+
+    cfg = config_mod.load()
+    snap = openrouter.status_snapshot()
+    fallback_models = cfg.get("openrouter_fallback_models") or []
+
+    lines = [
+        "Primary model:    %s" % cfg.get("openrouter_model"),
+        "Fallback models:  %s"
+        % (", ".join(fallback_models) if fallback_models else "(none configured)"),
+        "Rate limit remaining: %s" % (snap["rate_limit_remaining"] or "unknown"),
+        "Rate limit reset:     %s" % (snap["rate_limit_reset"] or "unknown"),
+        "Fallback mode active: %s" % ("yes" if snap["fallback_active"] else "no"),
+    ]
+    if snap["in_cooldown"]:
+        lines.append(
+            "[yellow]In cooldown[/yellow] for %ds more (all models recently failed)"
+            % snap["cooldown_seconds_left"]
+        )
+    lines.append("")
+    if snap["recent_errors"]:
+        lines.append("Recent errors:")
+        for err in snap["recent_errors"]:
+            when = datetime.fromtimestamp(err["ts"]).strftime("%H:%M:%S")
+            lines.append("  [%s] %s: %s" % (when, err["model"], err["error"]))
+    else:
+        lines.append("Recent errors: none")
+
+    console.print(
+        Panel.fit(
+            "\n".join(lines),
+            title="tokensnap openrouter-status",
+            border_style="cyan",
+        )
+    )
+
+
 @app.command()
 def mcp() -> None:
     """Run the Tokensnap MCP server on stdio (for Claude Desktop/Code)."""

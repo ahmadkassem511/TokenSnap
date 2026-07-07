@@ -30,6 +30,9 @@ _EMPTY: Dict[str, Any] = {
     # "regex (compressor_type=openrouter but no openrouter_api_key is set)"),
     # refreshed on each proxy start.
     "llm_status": "",
+    # Most recent X-RateLimit-* headers seen from OpenRouter (both fields
+    # None until at least one OpenRouter call has completed).
+    "openrouter_rate_limit": {"remaining": None, "reset": None},
     "totals": {
         # Tokensnap's own tiktoken estimate of the request body (in/out of
         # the optimizer) - drives the "saved" figure.
@@ -97,6 +100,16 @@ def set_llm_status(status: str) -> None:
     """Record the current Memory Card generator status for status/monitor."""
     data = load()
     data["llm_status"] = status
+    _save(data)
+
+
+def set_openrouter_rate_limit(
+    remaining: Optional[str], reset: Optional[str]
+) -> None:
+    """Record the most recent OpenRouter X-RateLimit-* headers, for
+    `tokensnap openrouter-status` and the dashboard/settings pages."""
+    data = load()
+    data["openrouter_rate_limit"] = {"remaining": remaining, "reset": reset}
     _save(data)
 
 

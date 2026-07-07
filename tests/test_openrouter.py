@@ -4,6 +4,7 @@ No OpenRouter server is ever contacted: the HTTP helper is monkeypatched.
 """
 
 import json
+import time
 import urllib.error
 
 import pytest
@@ -49,7 +50,7 @@ def _messages():
     ]
 
 
-def _mock_api(monkeypatch, model_output_text, fail=False):
+def _mock_api(monkeypatch, model_output_text, fail=False, resp_headers=None):
     """Patch the HTTP POST helper; returns a dict counting/recording calls."""
     calls = {"post": 0}
 
@@ -59,10 +60,39 @@ def _mock_api(monkeypatch, model_output_text, fail=False):
         calls["last_headers"] = headers
         if fail:
             raise urllib.error.URLError("timed out")
-        return {"choices": [{"message": {"content": model_output_text}}]}
+        body = {"choices": [{"message": {"content": model_output_text}}]}
+        return body, (resp_headers or {})
 
     monkeypatch.setattr(openrouter, "_http_post_json", fake_post)
     return calls
+
+
+def _mock_multi_model_api(monkeypatch, behavior_by_model):
+    """Patch the HTTP POST helper with per-model behavior.
+
+    `behavior_by_model[model]` is either a string (successful model output
+    text) or an exception instance to raise for that model.
+    """
+    calls = {"post": 0, "models_tried": []}
+
+    def fake_post(url, payload, headers, timeout):
+        calls["post"] += 1
+        model = payload["model"]
+        calls["models_tried"].append(model)
+        behavior = behavior_by_model[model]
+        if isinstance(behavior, BaseException):
+            raise behavior
+        return {"choices": [{"message": {"content": behavior}}]}, {}
+
+    monkeypatch.setattr(openrouter, "_http_post_json", fake_post)
+    return calls
+
+
+def _http_error(code, headers=None):
+    return urllib.error.HTTPError(
+        "https://openrouter.ai/api/v1/chat/completions", code, "err",
+        headers or {}, None,
+    )
 
 
 class TestEnabled:
@@ -158,6 +188,168 @@ class TestTryGenerateCard:
         assert openrouter.try_generate_card(_messages(), CFG) is None
         assert openrouter.try_generate_card(_messages(), CFG) is None
         assert calls["post"] == 1  # a broken model doesn't cost a call per request
+
+
+class TestFallbackAndRetry:
+    @pytest.fixture(autouse=True)
+    def no_real_sleep(self, monkeypatch):
+        # Retry delays are real in production; tests must not actually wait.
+        self.slept = []
+        monkeypatch.setattr(openrouter, "_sleep", lambda s: self.slept.append(s))
+
+    def test_falls_back_to_second_model_on_429(self, monkeypatch):
+        calls = _mock_multi_model_api(monkeypatch, {
+            "primary": _http_error(429),
+            "backup": json.dumps(RAW_MODEL_CARD),
+        })
+        cfg = {**CFG, "openrouter_model": "primary",
+               "openrouter_fallback_models": ["backup"]}
+        card = openrouter.try_generate_card(_messages(), cfg)
+        assert card == GOOD_CARD
+        assert calls["models_tried"] == ["primary", "backup"]
+        assert self.slept == [5]  # default openrouter_retry_delay_seconds
+
+    def test_uses_configured_retry_delay(self, monkeypatch):
+        _mock_multi_model_api(monkeypatch, {
+            "primary": _http_error(503),
+            "backup": json.dumps(RAW_MODEL_CARD),
+        })
+        cfg = {**CFG, "openrouter_model": "primary",
+               "openrouter_fallback_models": ["backup"],
+               "openrouter_retry_delay_seconds": 2}
+        openrouter.try_generate_card(_messages(), cfg)
+        assert self.slept == [2]
+
+    def test_non_retryable_error_skips_fallback_entirely(self, monkeypatch):
+        calls = _mock_multi_model_api(monkeypatch, {
+            "primary": _http_error(401),  # auth error - retrying won't help
+            "backup": json.dumps(RAW_MODEL_CARD),
+        })
+        cfg = {**CFG, "openrouter_model": "primary",
+               "openrouter_fallback_models": ["backup"]}
+        card = openrouter.try_generate_card(_messages(), cfg)
+        assert card is None
+        assert calls["models_tried"] == ["primary"]  # never tried backup
+        assert self.slept == []
+
+    def test_max_retries_caps_total_attempts(self, monkeypatch):
+        calls = _mock_multi_model_api(monkeypatch, {
+            "primary": _http_error(429),
+            "backup1": _http_error(429),
+            "backup2": json.dumps(RAW_MODEL_CARD),
+        })
+        cfg = {**CFG, "openrouter_model": "primary",
+               "openrouter_fallback_models": ["backup1", "backup2"],
+               "openrouter_max_retries": 1}  # only 1 retry beyond primary
+        card = openrouter.try_generate_card(_messages(), cfg)
+        assert card is None  # backup2 never reached
+        assert calls["models_tried"] == ["primary", "backup1"]
+
+    def test_empty_fallback_list_behaves_like_before(self, monkeypatch):
+        calls = _mock_api(monkeypatch, "", fail=True)
+        card = openrouter.try_generate_card(_messages(), CFG)
+        assert card is None
+        assert calls["post"] == 1
+
+    def test_fallback_active_flag_set_after_using_a_fallback(self, monkeypatch):
+        _mock_multi_model_api(monkeypatch, {
+            "primary": _http_error(429),
+            "backup": json.dumps(RAW_MODEL_CARD),
+        })
+        cfg = {**CFG, "openrouter_model": "primary",
+               "openrouter_fallback_models": ["backup"]}
+        assert openrouter.status_snapshot()["fallback_active"] is False
+        openrouter.try_generate_card(_messages(), cfg)
+        assert openrouter.status_snapshot()["fallback_active"] is True
+
+
+class TestCooldown:
+    @pytest.fixture(autouse=True)
+    def no_real_sleep(self, monkeypatch):
+        monkeypatch.setattr(openrouter, "_sleep", lambda s: None)
+
+    def test_all_models_failing_enters_cooldown(self, monkeypatch):
+        _mock_api(monkeypatch, "", fail=True)
+        assert openrouter.try_generate_card(_messages(), CFG) is None
+        assert openrouter.in_cooldown() is True
+
+    def test_cooldown_skips_further_calls_without_http(self, monkeypatch):
+        calls = _mock_api(monkeypatch, "", fail=True)
+        openrouter.try_generate_card(_messages(), CFG)
+        assert calls["post"] == 1
+        # A different transcript would normally trigger a fresh call, but
+        # cooldown must suppress it entirely.
+        different = [{"role": "user", "content": "a completely different task"}]
+        assert openrouter.try_generate_card(different, CFG) is None
+        assert calls["post"] == 1
+
+    def test_success_never_triggers_cooldown(self, monkeypatch):
+        _mock_api(monkeypatch, json.dumps(RAW_MODEL_CARD))
+        openrouter.try_generate_card(_messages(), CFG)
+        assert openrouter.in_cooldown() is False
+
+    def test_cached_hit_bypasses_cooldown_check(self, monkeypatch):
+        # A transcript that was already successfully cached should still
+        # return its cached card even while OpenRouter is in cooldown from
+        # unrelated failures.
+        calls = _mock_api(monkeypatch, json.dumps(RAW_MODEL_CARD))
+        card = openrouter.try_generate_card(_messages(), CFG)
+        assert card == GOOD_CARD
+        # Force a cooldown window without another failed call.
+        openrouter._cooldown_until = time.monotonic() + 60
+        assert openrouter.try_generate_card(_messages(), CFG) == GOOD_CARD
+        assert calls["post"] == 1  # served from cache, no new HTTP call
+
+
+class TestRateLimitCapture:
+    def test_headers_captured_on_success(self, monkeypatch):
+        _mock_api(
+            monkeypatch, json.dumps(RAW_MODEL_CARD),
+            resp_headers={"X-RateLimit-Remaining": "42", "X-RateLimit-Reset": "1700000000"},
+        )
+        openrouter.try_generate_card(_messages(), CFG)
+        snap = openrouter.status_snapshot()
+        assert snap["rate_limit_remaining"] == "42"
+        assert snap["rate_limit_reset"] == "1700000000"
+
+    def test_headers_captured_on_429_before_reraise(self, monkeypatch):
+        def fake_post(url, payload, headers, timeout):
+            raise _http_error(429, headers={"X-RateLimit-Remaining": "0"})
+
+        monkeypatch.setattr(openrouter, "_http_post_json", fake_post)
+        openrouter.try_generate_card(_messages(), CFG)
+        assert openrouter.status_snapshot()["rate_limit_remaining"] == "0"
+
+    def test_missing_headers_is_safe(self, monkeypatch):
+        _mock_api(monkeypatch, json.dumps(RAW_MODEL_CARD), resp_headers={})
+        openrouter.try_generate_card(_messages(), CFG)
+        snap = openrouter.status_snapshot()
+        assert snap["rate_limit_remaining"] is None
+
+    def test_persisted_to_stats(self, monkeypatch, tmp_path):
+        from tokensnap import stats
+
+        monkeypatch.setattr(stats, "STATS_DIR", tmp_path)
+        monkeypatch.setattr(stats, "STATS_FILE", tmp_path / "stats.json")
+        _mock_api(
+            monkeypatch, json.dumps(RAW_MODEL_CARD),
+            resp_headers={"X-RateLimit-Remaining": "7", "X-RateLimit-Reset": "123"},
+        )
+        openrouter.try_generate_card(_messages(), CFG)
+        data = stats.load()
+        assert data["openrouter_rate_limit"] == {"remaining": "7", "reset": "123"}
+
+
+class TestStatusSnapshotAndResetCaches:
+    def test_reset_caches_clears_everything(self, monkeypatch):
+        _mock_api(monkeypatch, "", fail=True)
+        openrouter.try_generate_card(_messages(), CFG)
+        assert openrouter.in_cooldown() is True
+        openrouter.reset_caches()
+        assert openrouter.in_cooldown() is False
+        snap = openrouter.status_snapshot()
+        assert snap["recent_errors"] == []
+        assert snap["fallback_active"] is False
 
 
 class TestSanitize:

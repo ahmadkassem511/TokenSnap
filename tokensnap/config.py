@@ -22,6 +22,16 @@ def _to_bool(value: Any) -> bool:
     raise ValueError("expected a boolean (true/false), got %r" % value)
 
 
+def _to_model_list(value: Any) -> list:
+    """Accept either a real list (already-loaded JSON) or a CLI string like
+    'model-a, model-b' and return a clean list of non-empty model names."""
+    if isinstance(value, list):
+        items = value
+    else:
+        items = str(value).split(",")
+    return [str(m).strip() for m in items if str(m).strip()]
+
+
 DEFAULTS: Dict[str, Any] = {
     # Proxy listener
     "host": "127.0.0.1",
@@ -52,6 +62,14 @@ DEFAULTS: Dict[str, Any] = {
     # Get a free key at https://openrouter.ai/keys
     "openrouter_api_key": "",
     "openrouter_model": "meta-llama/llama-3.1-8b-instruct:free",
+    # Models tried in order if openrouter_model fails with a retryable error
+    # (429/5xx/timeout). Empty means no fallback - a failure just falls back
+    # to the regex card, same as before.
+    "openrouter_fallback_models": [],
+    # Total attempts across openrouter_model + openrouter_fallback_models is
+    # capped at 1 + this value.
+    "openrouter_max_retries": 1,
+    "openrouter_retry_delay_seconds": 5,
     # Optional stored API key (normally unused: the proxy forwards the
     # key Claude Code already sends in request headers)
     "key": "",
@@ -66,6 +84,9 @@ _TYPES = {
     "min_messages_to_compress": int,
     "context_threshold": float,
     "selective_compression": _to_bool,
+    "openrouter_fallback_models": _to_model_list,
+    "openrouter_max_retries": int,
+    "openrouter_retry_delay_seconds": float,
 }
 
 # Keys restricted to a fixed set of values

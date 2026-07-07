@@ -96,6 +96,16 @@ Or manually, in any Python ≥3.9 environment:
 pip install -e .
 ```
 
+The installer ends by asking **"Do you want to open the setup dashboard
+now? [Y/n]"** — say yes and it launches `tokensnap dashboard` in the
+background and opens it in your browser, ready for the setup wizard. Say no
+and it just prints the same Quickstart commands below for later.
+
+It then asks **"Create a desktop shortcut to open the dashboard? [Y/n]"** —
+say yes and it adds a **"TokenSnap Dashboard"** shortcut to your Desktop
+(a `.lnk` on Windows, a `.command` file on macOS, a `.desktop` launcher on
+Linux) that runs `tokensnap dashboard` with no terminal needed.
+
 ### 2. Run
 
 The easy way — one command that starts the proxy (if needed) and launches Claude Code through it:
@@ -103,6 +113,11 @@ The easy way — one command that starts the proxy (if needed) and launches Clau
 ```bash
 tokensnap run claude
 ```
+
+Or click **"Launch Claude Code"** on the dashboard's setup wizard or Settings
+page — it starts the proxy if needed, then opens Claude Code in a new
+terminal window pointed at it. If Claude Code isn't installed, the button
+tells you how to get it instead of failing silently.
 
 Or manage it yourself:
 
@@ -223,6 +238,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:8889
 | `tokensnap config set <key> <value>` | Change a setting (see below). |
 | `tokensnap config get <key>` | Read one setting. |
 | `tokensnap preset <name>` | Apply a recommended configuration for your project type: `simple`, `balanced`, `complex`, `smart`, `maximum` — see [Tuning for your project type](#tuning-for-your-project-type). |
+| `tokensnap openrouter-status` | Show the primary/fallback OpenRouter models, remaining rate limit, whether fallback/cooldown mode is active, and recent errors. |
 | `tokensnap mcp` | Run Tokensnap as an MCP stdio server (status/config/start/stop as tools) — see below. |
 
 ### Stopping and resetting
@@ -267,6 +283,9 @@ Stored in `~/.tokensnap/config.json`. Everything has a sensible default:
 | `compressor_type` | `regex` | Memory Card generator: `regex` (fast, rule-based, offline), `openrouter` (a free hosted model writes a better summary), `off` (no Memory Card at all - full history kept, only noise cleaning applies). |
 | `openrouter_api_key` | *(empty)* | Your [OpenRouter](https://openrouter.ai/keys) key (free tier available). Required for `compressor_type=openrouter`. |
 | `openrouter_model` | `meta-llama/llama-3.1-8b-instruct:free` | Model used to write Memory Cards when `compressor_type=openrouter`. |
+| `openrouter_fallback_models` | *(empty)* | Comma-separated backup models tried in order if the primary model hits a rate limit or is down (429/5xx/timeout). |
+| `openrouter_max_retries` | `1` | Total attempts across the primary model + fallbacks is capped at `1 + this value`. |
+| `openrouter_retry_delay_seconds` | `5` | Seconds to wait before trying the next fallback model. |
 | `log_level` | `INFO` | Proxy log verbosity. |
 | `key` | *(empty)* | Optional stored Anthropic API key — normally unnecessary; the proxy forwards the key from request headers. |
 
@@ -393,6 +412,44 @@ Want a different model, or want it off?
 ```bash
 tokensnap config set openrouter_model qwen/qwen-2.5-7b-instruct:free
 tokensnap config set compressor_type regex
+```
+
+### Fallback models and rate-limit resilience
+
+A single free model can hit a 429 (rate limited) or a 503 under load.
+Configure backup models to try in order when that happens:
+
+```bash
+tokensnap config set openrouter_fallback_models "qwen/qwen-2.5-7b-instruct:free,mistralai/mistral-7b-instruct:free"
+```
+
+- On a *retryable* error (429/500/502/503/504, or a timeout), Tokensnap waits
+  `openrouter_retry_delay_seconds` (default 5) and tries the next model in
+  the list. Total attempts (primary + fallbacks) is capped at
+  `1 + openrouter_max_retries` (default 1, i.e. one fallback attempt).
+- A *non-retryable* error (e.g. a bad API key) stops immediately rather than
+  burning through the fallback list on something a retry can't fix.
+- If every attempted model fails, Tokensnap enters a 60-second cooldown:
+  further requests skip OpenRouter entirely (falling straight back to regex,
+  with zero added latency) until the cooldown expires.
+- `X-RateLimit-Remaining` / `X-RateLimit-Reset` response headers are captured
+  on every call (success or failure) and shown by `tokensnap openrouter-status`,
+  the Settings page, and the Dashboard's Memory Cards indicator (which turns
+  yellow in fallback mode, red during a cooldown):
+
+```bash
+tokensnap openrouter-status
+```
+```
+┌────────────── tokensnap openrouter-status ──────────────┐
+│ Primary model:    meta-llama/llama-3.1-8b-instruct:free │
+│ Fallback models:  qwen/qwen-2.5-7b-instruct:free        │
+│ Rate limit remaining: 42                                │
+│ Rate limit reset:     1700000000                        │
+│ Fallback mode active: no                                │
+│                                                          │
+│ Recent errors: none                                     │
+└──────────────────────────────────────────────────────────┘
 ```
 
 **Security:** the OpenRouter key is a *separate* credential from your

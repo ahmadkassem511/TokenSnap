@@ -73,6 +73,29 @@ if /i "%ADDPATH%"=="y" (
 )
 
 echo.
+set /p OPENDASH="Do you want to open the setup dashboard now? [Y/n] "
+if /i not "%OPENDASH%"=="n" (
+    echo Starting the dashboard in the background - it will open in your browser...
+    start "" ".venv\Scripts\tokensnap.exe" dashboard
+) else (
+    echo Skipped. Start it later with: tokensnap dashboard
+)
+
+echo.
+set /p MAKESHORTCUT="Create a desktop shortcut to open the dashboard? [Y/n] "
+if /i not "%MAKESHORTCUT%"=="n" (
+    for /f "delims=" %%D in ('powershell -NoProfile -Command "[Environment]::GetFolderPath('Desktop')"') do set "DESKTOPDIR=%%D"
+    powershell -NoProfile -Command "$ws = New-Object -ComObject WScript.Shell; $lnk = $ws.CreateShortcut('%DESKTOPDIR%\TokenSnap Dashboard.lnk'); $lnk.TargetPath = '%CD%\.venv\Scripts\tokensnap.exe'; $lnk.Arguments = 'dashboard'; $lnk.WorkingDirectory = '%CD%'; $lnk.WindowStyle = 7; $lnk.IconLocation = '%CD%\.venv\Scripts\tokensnap.exe,0'; $lnk.Description = 'Open the TokenSnap dashboard'; $lnk.Save()"
+    if exist "%DESKTOPDIR%\TokenSnap Dashboard.lnk" (
+        echo Desktop shortcut created: "TokenSnap Dashboard.lnk"
+    ) else (
+        echo [WARN] Could not create the desktop shortcut. You can still run: tokensnap dashboard
+    )
+) else (
+    echo Skipped desktop shortcut.
+)
+
+echo.
 echo Quickstart:
 echo   tokensnap dashboard        (web UI: setup wizard, charts ^& settings)
 echo   tokensnap start            (start the proxy)
