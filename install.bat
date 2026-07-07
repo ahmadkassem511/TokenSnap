@@ -82,17 +82,34 @@ if /i not "%OPENDASH%"=="n" (
 )
 
 echo.
-set /p MAKESHORTCUT="Create a desktop shortcut to open the dashboard? [Y/n] "
-if /i not "%MAKESHORTCUT%"=="n" (
-    for /f "delims=" %%D in ('powershell -NoProfile -Command "[Environment]::GetFolderPath('Desktop')"') do set "DESKTOPDIR=%%D"
-    powershell -NoProfile -Command "$ws = New-Object -ComObject WScript.Shell; $lnk = $ws.CreateShortcut('%DESKTOPDIR%\TokenSnap Dashboard.lnk'); $lnk.TargetPath = '%CD%\.venv\Scripts\tokensnap.exe'; $lnk.Arguments = 'dashboard'; $lnk.WorkingDirectory = '%CD%'; $lnk.WindowStyle = 7; $lnk.IconLocation = '%CD%\.venv\Scripts\tokensnap.exe,0'; $lnk.Description = 'Open the TokenSnap dashboard'; $lnk.Save()"
-    if exist "%DESKTOPDIR%\TokenSnap Dashboard.lnk" (
-        echo Desktop shortcut created: "TokenSnap Dashboard.lnk"
-    ) else (
-        echo [WARN] Could not create the desktop shortcut. You can still run: tokensnap dashboard
-    )
+echo Creating a desktop shortcut for the dashboard...
+REM A generated .ps1 file (rather than one long -Command line) avoids the
+REM nested single/double-quote mess that comes from mixing batch variable
+REM expansion, PowerShell string literals, and cmd's own quote parsing -
+REM that combination previously produced an empty desktop path and tried
+REM (and failed, for lack of permission) to save the shortcut to C:\.
+REM A space before every >> is required: cmd.exe treats a bare digit
+REM immediately adjacent to a redirection operator (e.g. "7>>") as an
+REM explicit file-descriptor number, silently swallowing it - which is
+REM exactly what corrupted the WindowStyle line before this fix.
+set "SHORTCUT_PS1=%TEMP%\tokensnap_make_shortcut.ps1"
+echo $desktop = [Environment]::GetFolderPath('Desktop') > "%SHORTCUT_PS1%"
+echo $ws = New-Object -ComObject WScript.Shell >> "%SHORTCUT_PS1%"
+echo $lnk = $ws.CreateShortcut("$desktop\TokenSnap Dashboard.lnk") >> "%SHORTCUT_PS1%"
+echo $lnk.TargetPath = "%CD%\.venv\Scripts\tokensnap.exe" >> "%SHORTCUT_PS1%"
+echo $lnk.Arguments = "dashboard" >> "%SHORTCUT_PS1%"
+echo $lnk.WorkingDirectory = "%CD%" >> "%SHORTCUT_PS1%"
+echo $lnk.WindowStyle = 7 >> "%SHORTCUT_PS1%"
+echo $lnk.IconLocation = "%CD%\.venv\Scripts\tokensnap.exe,0" >> "%SHORTCUT_PS1%"
+echo $lnk.Description = "Open the TokenSnap dashboard" >> "%SHORTCUT_PS1%"
+echo $lnk.Save() >> "%SHORTCUT_PS1%"
+echo Write-Output $desktop >> "%SHORTCUT_PS1%"
+for /f "delims=" %%D in ('powershell -NoProfile -ExecutionPolicy Bypass -File "%SHORTCUT_PS1%"') do set "DESKTOPDIR=%%D"
+del "%SHORTCUT_PS1%" >nul 2>nul
+if exist "%DESKTOPDIR%\TokenSnap Dashboard.lnk" (
+    echo Desktop shortcut created: "TokenSnap Dashboard.lnk"
 ) else (
-    echo Skipped desktop shortcut.
+    echo [WARN] Could not create the desktop shortcut. You can still run: tokensnap dashboard
 )
 
 echo.

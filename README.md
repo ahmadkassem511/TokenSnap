@@ -101,10 +101,10 @@ now? [Y/n]"** — say yes and it launches `tokensnap dashboard` in the
 background and opens it in your browser, ready for the setup wizard. Say no
 and it just prints the same Quickstart commands below for later.
 
-It then asks **"Create a desktop shortcut to open the dashboard? [Y/n]"** —
-say yes and it adds a **"TokenSnap Dashboard"** shortcut to your Desktop
-(a `.lnk` on Windows, a `.command` file on macOS, a `.desktop` launcher on
-Linux) that runs `tokensnap dashboard` with no terminal needed.
+It then automatically adds a **"TokenSnap Dashboard"** shortcut to your
+Desktop (no confirmation needed) — a `.lnk` on Windows, a `.command` file
+on macOS, a `.desktop` launcher on Linux — that runs `tokensnap dashboard`
+directly, so you never need to open a terminal to reach it again.
 
 ### 2. Run
 

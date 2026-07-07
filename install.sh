@@ -82,30 +82,24 @@ case "$OPENDASH" in
 esac
 
 echo ""
-printf "Create a desktop shortcut to open the dashboard? [Y/n] "
-read -r MAKESHORTCUT
-case "$MAKESHORTCUT" in
-    [Nn]*)
-        echo "Skipped desktop shortcut."
-        ;;
-    *)
-        DESKTOP_DIR="$HOME/Desktop"
-        if [ ! -d "$DESKTOP_DIR" ]; then
-            echo "[WARN] No Desktop folder found at $DESKTOP_DIR - skipping shortcut."
-        else
-            TOKENSNAP_BIN="$(pwd)/.venv/bin/tokensnap"
-            if [ "$(uname)" = "Darwin" ]; then
-                SHORTCUT="$DESKTOP_DIR/TokenSnap Dashboard.command"
-                cat > "$SHORTCUT" <<SHORTCUT_EOF
+echo "Creating a desktop shortcut for the dashboard..."
+DESKTOP_DIR="$HOME/Desktop"
+if [ ! -d "$DESKTOP_DIR" ]; then
+    echo "[WARN] No Desktop folder found at $DESKTOP_DIR - skipping shortcut."
+else
+    TOKENSNAP_BIN="$(pwd)/.venv/bin/tokensnap"
+    if [ "$(uname)" = "Darwin" ]; then
+        SHORTCUT="$DESKTOP_DIR/TokenSnap Dashboard.command"
+        cat > "$SHORTCUT" <<SHORTCUT_EOF
 #!/usr/bin/env bash
 cd "$(pwd)"
 "$TOKENSNAP_BIN" dashboard
 SHORTCUT_EOF
-                chmod +x "$SHORTCUT"
-                echo "Desktop shortcut created: $SHORTCUT"
-            else
-                SHORTCUT="$DESKTOP_DIR/TokenSnap-Dashboard.desktop"
-                cat > "$SHORTCUT" <<SHORTCUT_EOF
+        chmod +x "$SHORTCUT"
+        echo "Desktop shortcut created: $SHORTCUT"
+    else
+        SHORTCUT="$DESKTOP_DIR/TokenSnap-Dashboard.desktop"
+        cat > "$SHORTCUT" <<SHORTCUT_EOF
 [Desktop Entry]
 Type=Application
 Name=TokenSnap Dashboard
@@ -115,17 +109,15 @@ Path=$(pwd)
 Terminal=true
 Categories=Development;
 SHORTCUT_EOF
-                chmod +x "$SHORTCUT"
-                # Newer GNOME/Nautilus requires marking .desktop launchers as
-                # trusted, or it shows an "Untrusted application" warning
-                # instead of running. Harmless (and silently skipped) if
-                # `gio` isn't installed or the DE doesn't need it.
-                gio set "$SHORTCUT" metadata::trusted true >/dev/null 2>&1 || true
-                echo "Desktop shortcut created: $SHORTCUT"
-            fi
-        fi
-        ;;
-esac
+        chmod +x "$SHORTCUT"
+        # Newer GNOME/Nautilus requires marking .desktop launchers as
+        # trusted, or it shows an "Untrusted application" warning instead
+        # of running. Harmless (and silently skipped) if `gio` isn't
+        # installed or the DE doesn't need it.
+        gio set "$SHORTCUT" metadata::trusted true >/dev/null 2>&1 || true
+        echo "Desktop shortcut created: $SHORTCUT"
+    fi
+fi
 
 echo ""
 echo "Quickstart:"
