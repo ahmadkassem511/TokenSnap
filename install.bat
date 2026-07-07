@@ -8,7 +8,7 @@ REM ============================================================
 cd /d "%~dp0"
 
 echo.
-echo === Tokensnap installer ===
+echo === Tokensnap v2 installer ===
 echo.
 
 REM --- 1. Find Python ---------------------------------------
@@ -74,9 +74,14 @@ if /i "%ADDPATH%"=="y" (
 
 echo.
 echo Quickstart:
-echo     tokensnap dashboard      (web UI: setup wizard, charts ^& settings)
-echo     tokensnap start          (start the proxy)
-echo     tokensnap run claude     (launch Claude Code through the proxy)
-echo     tokensnap monitor        (live savings dashboard, terminal)
+echo   tokensnap dashboard        (web UI: setup wizard, charts ^& settings)
+echo   tokensnap start            (start the proxy)
+echo   tokensnap run claude       (launch Claude Code through the proxy)
+echo   tokensnap monitor          (live savings dashboard, terminal)
+echo   tokensnap preset smart     (activate intelligent selective compression)
+echo.
+echo For best quality: run 'tokensnap preset smart' once.
+echo Optionally, get a free OpenRouter key ^(https://openrouter.ai/keys^)
+echo to enable AI-powered Memory Cards: tokensnap config set openrouter_api_key YOUR_KEY
 echo.
 pause
