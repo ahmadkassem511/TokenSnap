@@ -99,6 +99,33 @@ class TestContextEngineTotals:
         assert totals["context_events_fetched"] == 0
 
 
+class TestProjectPassthrough:
+    @pytest.fixture(autouse=True)
+    def isolated_history(self, tmp_path, monkeypatch):
+        from tokensnap import history
+
+        monkeypatch.setattr(history, "DB_FILE", tmp_path / "history.db")
+        yield
+
+    def test_record_request_tags_history_with_project(self):
+        from tokensnap import history
+
+        stats.mark_started("127.0.0.1", 8889)
+        stats.record_request("/v1/messages", "m", 100, 60, 200, 0.1,
+                             project="my-cool-project")
+        rows = history.project_totals()
+        assert len(rows) == 1
+        assert rows[0]["project"] == "my-cool-project"
+        assert rows[0]["requests"] == 1
+
+    def test_record_request_defaults_project_to_unknown(self):
+        from tokensnap import history
+
+        stats.mark_started("127.0.0.1", 8889)
+        stats.record_request("/v1/messages", "m", 100, 60, 200, 0.1)
+        assert history.project_totals()[0]["project"] == "unknown"
+
+
 class TestRealUsage:
     def test_record_accumulates_real_usage(self):
         stats.mark_started("127.0.0.1", 8889)

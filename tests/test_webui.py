@@ -581,3 +581,105 @@ class TestLaunchUsesProjectDir:
         ok, _ = webui._launch_claude_terminal()
         assert ok is True
         assert calls["k"].get("cwd") is None  # guarded fallback, no crash
+
+    def test_launch_exports_project_env(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(webui.subprocess, "Popen", lambda *a, **k: None)
+        monkeypatch.delenv("TOKENSNAP_PROJECT", raising=False)
+        proj = tmp_path / "tagged"
+        proj.mkdir()
+        webui.set_launch_dir(str(proj))
+        webui._launch_claude_terminal()
+        # The proxy (started with this environment) reads TOKENSNAP_PROJECT to
+        # tag its request rows; it must match the selected launch dir.
+        assert os.environ["TOKENSNAP_PROJECT"] == webui.get_launch_dir()
+
+
+class TestMultiLevelStatsEndpoints:
+    @pytest.fixture(autouse=True)
+    def isolated(self, tmp_path, monkeypatch):
+        from tokensnap import config as config_mod, history
+
+        monkeypatch.setattr(webui.config_mod, "CONFIG_DIR", tmp_path)
+        monkeypatch.setattr(webui.config_mod, "CONFIG_FILE", tmp_path / "config.json")
+        monkeypatch.setattr(webui.stats, "STATS_DIR", tmp_path)
+        monkeypatch.setattr(webui.stats, "STATS_FILE", tmp_path / "stats.json")
+        monkeypatch.setattr(history, "DB_FILE", tmp_path / "history.db")
+        defaults = dict(config_mod.DEFAULTS)
+        # A port nothing is listening on -> proxy_running() is False, no I/O.
+        defaults["port"] = 6553
+        monkeypatch.setattr(config_mod, "DEFAULTS", defaults)
+        # Keep proxy_running from actually probing a socket.
+        monkeypatch.setattr(webui.stats, "proxy_running", lambda *a, **k: False)
+        yield
+
+    def _json(self, coro):
+        return json.loads(asyncio.run(coro).text)
+
+    def test_routes_registered(self):
+        app = webui.build_app()
+        paths = {r.resource.canonical for r in app.router.routes()}
+        assert "/api/stats/session" in paths
+        assert "/api/stats/alltime" in paths
+        assert "/api/stats/projects" in paths
+
+    def test_alltime_reads_history_db(self):
+        from tokensnap import history
+
+        history.log_request(
+            model="m", est_tokens_in=100, real_tokens_in=80, real_tokens_out=20,
+            cache_read=0, cache_write=0, saved=60, http_status=200, project="p1",
+        )
+        data = self._json(webui.api_stats_alltime(None))
+        assert data["total_requests"] == 1
+        assert data["total_est_saved"] == 60
+        assert data["total_real_in"] == 80
+        assert data["total_real_out"] == 20
+
+    def test_projects_endpoint_orders_and_adds_display_name(self):
+        from tokensnap import history
+
+        history.log_request(model="m", est_tokens_in=1, real_tokens_in=1,
+                            real_tokens_out=1, cache_read=0, cache_write=0,
+                            saved=10, http_status=200, project="C:/work/small")
+        history.log_request(model="m", est_tokens_in=1, real_tokens_in=1,
+                            real_tokens_out=1, cache_read=0, cache_write=0,
+                            saved=900, http_status=200, project="/home/me/big-proj")
+        data = self._json(webui.api_stats_projects(None))
+        projs = data["projects"]
+        assert [p["project"] for p in projs] == ["/home/me/big-proj", "C:/work/small"]
+        # Display name is the last path segment, for both separators.
+        assert projs[0]["name"] == "big-proj"
+        assert projs[1]["name"] == "small"
+
+    def test_projects_endpoint_empty_on_fresh_db(self):
+        data = self._json(webui.api_stats_projects(None))
+        assert data["projects"] == []
+
+    def test_session_endpoint_reads_stats_json(self):
+        webui.stats.mark_started("127.0.0.1", 6553)
+        webui.stats.record_request("/v1/messages", "m", 100, 40, 200, 0.1)
+        data = self._json(webui.api_stats_session(None))
+        assert data["requests"] == 1
+        assert data["tokens_saved"] == 60
+        assert data["running"] is False
+
+    def test_display_name_helper_handles_edge_cases(self):
+        assert webui._project_display_name("unknown") == "unknown"
+        assert webui._project_display_name("") == "unknown"
+        assert webui._project_display_name("C:/a/b/proj") == "proj"
+        assert webui._project_display_name("/x/y/z/") == "z"
+        assert webui._project_display_name("bare") == "bare"
+
+    def test_dashboard_page_has_three_level_cards_and_projects(self):
+        html = webui._dashboard_page()
+        # Three-level summary cards.
+        for eid in ("s_saved", "a_saved", "p_count"):
+            assert "id='%s'" % eid in html
+        # Project stats section + filter + friendly empty message.
+        assert "id='projects'" in html
+        assert "id='projfilter'" in html
+        assert "No projects tracked yet" in html
+        # Wired to the new endpoints + localStorage persistence.
+        assert "/api/stats/alltime" in html
+        assert "/api/stats/projects" in html
+        assert "tsnap_project_filter" in html

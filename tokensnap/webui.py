@@ -157,9 +157,68 @@ async def api_stats(request: web.Request) -> web.Response:
 
 
 async def api_chart(request: web.Request) -> web.Response:
-    """Aggregated saved-token series for the requested period."""
+    """Aggregated saved-token series for the requested period, optionally
+    filtered to a single project (``?project=...``)."""
     period = request.query.get("period", "day")
-    return web.json_response(history.chart_data(period))
+    project = request.query.get("project") or None
+    return web.json_response(history.chart_data(period, project=project))
+
+
+async def api_stats_session(request: web.Request) -> web.Response:
+    """Current-session summary from stats.json (resets on proxy restart) - the
+    'This Session' level of the dashboard's three-level stats."""
+    cfg = config_mod.load()
+    data = stats.load()
+    totals = data["totals"]
+    before = totals["tokens_before"]
+    saved = totals["tokens_saved"]
+    pct = 100.0 * saved / before if before else 0.0
+    return web.json_response({
+        "running": stats.proxy_running(cfg["host"], int(cfg["port"])),
+        "requests": totals["requests"],
+        "tokens_saved": saved,
+        "pct": round(pct, 1),
+        "real_input": totals["real_input"],
+        "real_output": totals["real_output"],
+    })
+
+
+async def api_stats_alltime(request: web.Request) -> web.Response:
+    """Cumulative totals from the persistent history DB - the 'All Time' level.
+    Survives proxy restarts, unlike the session totals in stats.json."""
+    t = history.totals()
+    return web.json_response({
+        "total_requests": t["requests"],
+        "total_est_saved": t["saved"],
+        "total_real_in": t["real_in"],
+        "total_real_out": t["real_out"],
+    })
+
+
+async def api_stats_projects(request: web.Request) -> web.Response:
+    """Per-project all-time breakdown, most tokens-saved first. Each entry also
+    carries a short display name (the last path segment) for the UI."""
+    projects = []
+    for p in history.project_totals():
+        projects.append({
+            "project": p["project"],
+            "name": _project_display_name(p["project"]),
+            "requests": p["requests"],
+            "saved": p["saved"],
+            "real_in": p["real_in"],
+            "real_out": p["real_out"],
+        })
+    return web.json_response({"projects": projects})
+
+
+def _project_display_name(project: str) -> str:
+    """Short, readable label for a project - the last path segment of a
+    directory path, or the value itself if it isn't path-like."""
+    if not project or project == "unknown":
+        return "unknown"
+    trimmed = project.replace("\\", "/").rstrip("/")
+    tail = trimmed.rsplit("/", 1)[-1]
+    return tail or project
 
 
 async def api_log(request: web.Request) -> web.Response:
@@ -306,6 +365,13 @@ def _launch_claude_terminal() -> "tuple[bool, str]":
     # is delegated to `tokensnap run claude`, which resolves it again itself.
     if resolve_claude_command(["claude"]) is None:
         return False, _CLAUDE_INSTALL_HINT
+
+    # Tag this session's requests with the selected project folder so the
+    # dashboard's per-project stats attribute them correctly. Set before
+    # starting the proxy so the detached proxy inherits it (it reads
+    # TOKENSNAP_PROJECT from its environment); `tokensnap run claude` in the
+    # spawned terminal keeps this same value via os.environ.setdefault.
+    os.environ["TOKENSNAP_PROJECT"] = get_launch_dir()
 
     if not stats.proxy_running(*_proxy_host_port()):
         ok, log_path = stats.start_proxy_detached()
@@ -465,6 +531,9 @@ def build_app() -> web.Application:
     app = web.Application()
     app.router.add_get("/", index)
     app.router.add_get("/api/stats", api_stats)
+    app.router.add_get("/api/stats/session", api_stats_session)
+    app.router.add_get("/api/stats/alltime", api_stats_alltime)
+    app.router.add_get("/api/stats/projects", api_stats_projects)
     app.router.add_get("/api/chart", api_chart)
     app.router.add_get("/api/log", api_log)
     app.router.add_get("/api/openrouter-status", api_openrouter_status)
@@ -550,6 +619,20 @@ td.r,th.r{text-align:right}
 .log{background:#0a0e14;border:1px solid var(--border);border-radius:10px;padding:14px;height:280px;overflow:auto;
   font-family:ui-monospace,'Cascadia Code',Consolas,monospace;font-size:12px;color:#c9d1d9;white-space:pre-wrap}
 .empty{color:var(--muted);text-align:center;padding:40px 10px;font-size:14px}
+.card.level{cursor:default}
+.card.level .big{font-size:26px}
+.projscroll{display:flex;gap:14px;overflow-x:auto;padding:4px 2px 10px}
+.projcard{flex:0 0 220px;background:var(--panel2);border:1px solid var(--border);border-radius:12px;
+  padding:14px 16px;cursor:pointer;transition:.15s}
+.projcard:hover{border-color:var(--accent2)}
+.projcard.active{border-color:var(--accent);box-shadow:0 0 0 1px var(--accent) inset}
+.projcard .pname{font-weight:700;font-size:14.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.projcard .ppath{font-size:11px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:2px}
+.projcard .pnum{font-size:20px;font-weight:700;color:var(--accent);margin-top:10px}
+.projcard .pmeta{font-size:11.5px;color:var(--muted);margin-top:2px}
+.bar{height:6px;border-radius:999px;background:var(--border);margin-top:10px;overflow:hidden}
+.bar>span{display:block;height:100%;background:var(--accent)}
+.projfilter{max-width:280px}
 label.f{display:block;margin:16px 0 6px;font-weight:600;font-size:14px}
 label.f small{color:var(--muted);font-weight:400}
 input[type=text],input[type=number],select{width:100%;padding:10px 12px;background:var(--panel2);
@@ -631,12 +714,17 @@ refreshPill();setInterval(refreshPill,3000);
 def _dashboard_page() -> str:
     body = """
 <div class='grid cards'>
-  <div class='card'><h3>Estimated tokens saved</h3><div class='big accent' id='c_saved'>-</div>
-    <div class='sub'><span id='c_pct'>-</span> of request context</div></div>
-  <div class='card'><h3>Requests optimized</h3><div class='big' id='c_reqs'>-</div>
-    <div class='sub'>since the proxy last started</div></div>
+  <div class='card level'><h3>This Session</h3><div class='big accent' id='s_saved'>-</div>
+    <div class='sub' id='s_sub'>tokens saved &middot; since the proxy last started</div></div>
+  <div class='card level'><h3>All Time</h3><div class='big' id='a_saved'>-</div>
+    <div class='sub' id='a_sub'>tokens saved across all sessions</div></div>
+  <div class='card level'><h3>Total Projects</h3><div class='big' id='p_count'>-</div>
+    <div class='sub' id='p_sub'>tracked in your history</div></div>
+</div>
+
+<div class='grid cards' style='margin-top:18px'>
   <div class='card'><h3>Real usage (Anthropic)</h3><div class='big' id='c_real'>-</div>
-    <div class='sub'>in / out tokens</div></div>
+    <div class='sub'>in / out tokens (this session)</div></div>
   <div class='card'><h3>Active model</h3><div class='big' id='c_model' style='font-size:19px'>-</div>
     <div class='sub'>keep_messages = <span id='c_keep'>-</span></div></div>
   <div class='card'><h3>Differential Context Engine</h3><div class='big' id='c_ctx' style='font-size:17px'>-</div>
@@ -645,8 +733,22 @@ def _dashboard_page() -> str:
 
 <div class='panel'>
   <div style='display:flex;align-items:center;gap:14px;flex-wrap:wrap'>
+    <h2 style='margin:0'>Project stats</h2>
+    <span class='sub muted' style='margin-left:auto' id='projhint'></span>
+  </div>
+  <div class='projscroll' id='projects'></div>
+  <div id='projempty' class='empty' style='display:none'>
+    No projects tracked yet. Launch Claude Code from this dashboard or via
+    <b>tokensnap run claude</b> to start tracking.</div>
+</div>
+
+<div class='panel'>
+  <div style='display:flex;align-items:center;gap:14px;flex-wrap:wrap'>
     <h2 style='margin:0'>Tokens saved over time</h2>
-    <div class='chartbtns' style='margin:0 0 0 auto'>
+    <select id='projfilter' class='projfilter' style='margin-left:auto'>
+      <option value=''>All projects</option>
+    </select>
+    <div class='chartbtns' style='margin:0'>
       <button data-p='day' class='active'>7 days</button>
       <button data-p='week'>8 weeks</button>
       <button data-p='month'>6 months</button>
@@ -705,6 +807,9 @@ def _dashboard_page() -> str:
 _DASH_JS = """
 <script>
 var chart, period='day', orStatus={fallback_active:false,in_cooldown:false};
+// Chart project filter, persisted across refreshes ('' = all projects).
+var projectFilter='';
+try{projectFilter=localStorage.getItem('tsnap_project_filter')||'';}catch(e){}
 function esc(s){return String(s).replace(/[&<>]/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;'}[c];});}
 function updateLLMPill(compressorType, keySet){
   var pill=document.getElementById('llmpill');
@@ -722,9 +827,10 @@ async function loadORStatus(){
   catch(e){}
 }
 window.onStats=function(s){
-  document.getElementById('c_saved').textContent=fmt(s.tokens_saved);
-  document.getElementById('c_pct').textContent=(s.pct||0)+'%';
-  document.getElementById('c_reqs').textContent=fmt(s.requests);
+  // "This Session" level card (volatile stats.json; resets on proxy restart).
+  document.getElementById('s_saved').textContent=fmt(s.tokens_saved);
+  document.getElementById('s_sub').textContent=
+    fmt(s.requests)+' requests \\u00b7 '+(s.pct||0)+'% of context saved';
   document.getElementById('c_real').textContent=fmt(s.real_input)+' / '+fmt(s.real_output);
   document.getElementById('c_model').textContent=s.active_model||'-';
   document.getElementById('c_keep').textContent=s.keep_messages;
@@ -736,6 +842,64 @@ window.onStats=function(s){
   updateLLMPill(s.compressor_type, s.openrouter_api_key_set);
   renderRecent(s.recent||[]);
 };
+// "All Time" level card - persistent totals from the history DB.
+async function loadAllTime(){
+  try{
+    var a=await (await fetch('/api/stats/alltime')).json();
+    document.getElementById('a_saved').textContent=fmt(a.total_est_saved);
+    document.getElementById('a_sub').textContent=
+      fmt(a.total_requests)+' requests \\u00b7 '+fmt(a.total_real_in)+' in / '+fmt(a.total_real_out)+' out';
+  }catch(e){}
+}
+function projShortName(p){var t=String(p||'').replace(/[\\\\/]+$/,'').split(/[\\\\/]/);return t[t.length-1]||p;}
+// "Total Projects" card + the horizontal project-stats strip + filter dropdown.
+async function loadProjects(){
+  try{
+    var d=await (await fetch('/api/stats/projects')).json();
+    var list=(d.projects||[]).filter(function(p){return p.project && p.project!=='unknown';});
+    var unknown=(d.projects||[]).filter(function(p){return !p.project || p.project==='unknown';});
+    var shown=list.concat(unknown);
+    document.getElementById('p_count').textContent=fmt(list.length);
+    document.getElementById('p_sub').textContent=list.length?
+      ('top: '+projShortName(list[0].project)):'tracked in your history';
+    var box=document.getElementById('projects'), empty=document.getElementById('projempty');
+    if(!shown.length){box.innerHTML='';box.style.display='none';empty.style.display='block';
+      document.getElementById('projhint').textContent='';syncFilterOptions([]);return;}
+    box.style.display='flex';empty.style.display='none';
+    document.getElementById('projhint').textContent='click a card to filter the chart';
+    var max=Math.max.apply(null,shown.map(function(p){return p.saved||0}).concat([1]));
+    box.innerHTML=shown.map(function(p){
+      var pct=Math.round(100*(p.saved||0)/max);
+      var active=(p.project===projectFilter)?' active':'';
+      return "<div class='projcard"+active+"' data-project='"+esc(p.project)+"'>"+
+        "<div class='pname'>"+esc(projShortName(p.project))+"</div>"+
+        "<div class='ppath'>"+esc(p.project)+"</div>"+
+        "<div class='pnum'>"+fmt(p.saved)+"</div>"+
+        "<div class='pmeta'>tokens saved \\u00b7 "+fmt(p.requests)+" requests</div>"+
+        "<div class='bar'><span style='width:"+pct+"%'></span></div></div>";
+    }).join('');
+    box.querySelectorAll('.projcard').forEach(function(c){
+      c.onclick=function(){setProjectFilter(c.dataset.project===projectFilter?'':c.dataset.project);};
+    });
+    syncFilterOptions(shown);
+  }catch(e){}
+}
+function syncFilterOptions(projects){
+  var sel=document.getElementById('projfilter');
+  var opts="<option value=''>All projects</option>"+projects.map(function(p){
+    return "<option value='"+esc(p.project)+"'>"+esc(projShortName(p.project))+"</option>";
+  }).join('');
+  sel.innerHTML=opts;
+  sel.value=projectFilter;  // may be '' if the stored project has no rows yet
+}
+function setProjectFilter(p){
+  projectFilter=p||'';
+  try{localStorage.setItem('tsnap_project_filter',projectFilter);}catch(e){}
+  document.getElementById('projfilter').value=projectFilter;
+  document.querySelectorAll('.projcard').forEach(function(c){
+    c.classList.toggle('active',c.dataset.project===projectFilter&&projectFilter!=='');});
+  loadChart();
+}
 function renderRecent(rows){
   var tb=document.getElementById('recent');
   if(!rows.length){tb.innerHTML="<tr><td colspan='7' class='empty'>no requests yet</td></tr>";return;}
@@ -749,7 +913,8 @@ function renderRecent(rows){
 }
 async function loadChart(){
   try{
-    var d=await (await fetch('/api/chart?period='+period)).json();
+    var url='/api/chart?period='+period+(projectFilter?'&project='+encodeURIComponent(projectFilter):'');
+    var d=await (await fetch(url)).json();
     document.getElementById('chartempty').style.display=d.has_data?'none':'flex';
     var ctx=document.getElementById('chart');
     if(!window.Chart)return;
@@ -765,6 +930,7 @@ async function loadChart(){
 document.querySelectorAll('.chartbtns button').forEach(function(b){
   b.onclick=function(){document.querySelectorAll('.chartbtns button').forEach(function(x){x.classList.remove('active')});
     b.classList.add('active');period=b.dataset.p;loadChart();};});
+document.getElementById('projfilter').onchange=function(){setProjectFilter(this.value);};
 async function loadLog(){
   try{
     var d=await (await fetch('/api/log')).json();
@@ -824,6 +990,8 @@ document.getElementById('launchbtn').onclick=async function(){
   setTimeout(function(){self.disabled=false;},2500);
 };
 loadProjectDir();
+loadAllTime();setInterval(loadAllTime,15000);
+loadProjects();setInterval(loadProjects,15000);
 setTimeout(loadChart,300);setInterval(loadChart,15000);
 loadLog();setInterval(loadLog,3000);
 loadORStatus();setInterval(loadORStatus,10000);

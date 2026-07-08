@@ -42,7 +42,8 @@ CREATE TABLE IF NOT EXISTS requests (
     cache_read       INTEGER NOT NULL DEFAULT 0,
     cache_write      INTEGER NOT NULL DEFAULT 0,
     saved            INTEGER NOT NULL DEFAULT 0,
-    http_status      INTEGER NOT NULL DEFAULT 0
+    http_status      INTEGER NOT NULL DEFAULT 0,
+    project          TEXT    NOT NULL DEFAULT 'unknown'
 );
 CREATE INDEX IF NOT EXISTS idx_requests_ts ON requests (timestamp);
 
@@ -71,11 +72,30 @@ def _connect() -> sqlite3.Connection:
     return conn
 
 
+def _ensure_schema(conn: sqlite3.Connection) -> None:
+    """Create/migrate the schema on an open connection. Safe to call every time.
+
+    A pre-``project`` database (rows table already exists without the column)
+    is migrated in place with ALTER TABLE, since SQLite has no
+    ``ADD COLUMN IF NOT EXISTS``. The project index is created only *after* the
+    column is guaranteed, so it can't fail on a legacy DB mid-``executescript``.
+    """
+    conn.executescript(_SCHEMA)
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(requests)").fetchall()}
+    if "project" not in cols:
+        conn.execute(
+            "ALTER TABLE requests ADD COLUMN project TEXT NOT NULL DEFAULT 'unknown'"
+        )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_requests_project ON requests (project)"
+    )
+
+
 def init_db() -> None:
     """Create the tables if they don't exist yet. Safe to call repeatedly."""
     conn = _connect()
     try:
-        conn.executescript(_SCHEMA)
+        _ensure_schema(conn)
         conn.commit()
     finally:
         conn.close()
@@ -91,25 +111,29 @@ def log_request(
     saved: int,
     http_status: int,
     ts: Optional[float] = None,
+    project: str = "unknown",
 ) -> None:
     """Record one optimized request. Best-effort: never raises.
 
-    Also folds the row into ``daily_summary`` for today so month/all-time
-    aggregates stay cheap without a nightly job.
+    ``project`` tags the row so the dashboard can break stats down per project
+    (see ``project_totals``); it defaults to 'unknown'. Also folds the row into
+    ``daily_summary`` for today so month/all-time aggregates stay cheap without
+    a nightly job.
     """
     ts = time.time() if ts is None else ts
     day = datetime.fromtimestamp(ts).strftime("%Y-%m-%d")
+    project = str(project or "unknown")
     try:
         conn = _connect()
         try:
-            conn.executescript(_SCHEMA)  # cheap CREATE IF NOT EXISTS; self-heals a fresh DB
+            _ensure_schema(conn)  # cheap CREATE/migrate; self-heals a fresh or legacy DB
             conn.execute(
                 "INSERT INTO requests (timestamp, model, est_tokens_in, "
                 "real_tokens_in, real_tokens_out, cache_read, cache_write, "
-                "saved, http_status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "saved, http_status, project) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (ts, model or "?", int(est_tokens_in), int(real_tokens_in),
                  int(real_tokens_out), int(cache_read), int(cache_write),
-                 int(saved), int(http_status)),
+                 int(saved), int(http_status), project),
             )
             conn.execute(
                 "INSERT INTO daily_summary (date, total_requests, total_est_in, "
@@ -185,22 +209,29 @@ def _strftime_key(period: str) -> str:
     return "%Y-%m-%d"
 
 
-def chart_data(period: str = "day") -> Dict[str, Any]:
+def chart_data(period: str = "day", project: Optional[str] = None) -> Dict[str, Any]:
     """Return aggregated saved/real-token data for the requested period.
 
     ``period`` is one of ``day`` (last 7 days), ``week`` (last 8 weeks), or
-    ``month`` (last 6 months). Always returns a full, zero-filled series so the
-    chart shows a continuous axis even when traffic is sparse. Never raises -
-    an unreadable DB yields an all-zero series with ``has_data`` False.
+    ``month`` (last 6 months). When ``project`` is given, only rows tagged with
+    that project are counted (the dashboard's project filter). Always returns a
+    full, zero-filled series so the chart shows a continuous axis even when
+    traffic is sparse. Never raises - an unreadable DB yields an all-zero series
+    with ``has_data`` False.
     """
     period = period if period in ("day", "week", "month") else "day"
     skeleton = _bucket_rows(period)
     fmt = _strftime_key(period)
+    where = ""
+    params: List[Any] = [fmt]
+    if project:
+        where = "WHERE project = ? "
+        params.append(project)
     by_key: Dict[str, Dict[str, int]] = {}
     try:
         conn = _connect()
         try:
-            conn.executescript(_SCHEMA)
+            _ensure_schema(conn)
             rows = conn.execute(
                 "SELECT strftime(?, timestamp, 'unixepoch', 'localtime') AS k, "
                 "COUNT(*) AS requests, "
@@ -208,8 +239,8 @@ def chart_data(period: str = "day") -> Dict[str, Any]:
                 "COALESCE(SUM(est_tokens_in), 0) AS est_in, "
                 "COALESCE(SUM(real_tokens_in), 0) AS real_in, "
                 "COALESCE(SUM(real_tokens_out), 0) AS real_out "
-                "FROM requests GROUP BY k",
-                (fmt,),
+                "FROM requests " + where + "GROUP BY k",
+                params,
             ).fetchall()
             for r in rows:
                 by_key[r["k"]] = {
@@ -232,6 +263,7 @@ def chart_data(period: str = "day") -> Dict[str, Any]:
         real_out.append(int(agg.get("real_out", 0)))
     return {
         "period": period,
+        "project": project or None,
         "labels": labels,
         "saved": saved,
         "requests": requests,
@@ -247,7 +279,7 @@ def totals() -> Dict[str, int]:
     try:
         conn = _connect()
         try:
-            conn.executescript(_SCHEMA)
+            _ensure_schema(conn)
             row = conn.execute(
                 "SELECT COUNT(*) AS requests, COALESCE(SUM(saved),0) AS saved, "
                 "COALESCE(SUM(est_tokens_in),0) AS est_in, "
@@ -263,3 +295,34 @@ def totals() -> Dict[str, int]:
             conn.close()
     except (sqlite3.Error, OSError):
         return empty
+
+
+def project_totals() -> List[Dict[str, Any]]:
+    """Per-project all-time aggregates, most tokens-saved first.
+
+    Returns a list of ``{"project", "requests", "saved", "real_in", "real_out"}``
+    dicts. Never raises - an unreadable DB yields an empty list.
+    """
+    try:
+        conn = _connect()
+        try:
+            _ensure_schema(conn)
+            rows = conn.execute(
+                "SELECT project, COUNT(*) AS requests, "
+                "COALESCE(SUM(saved),0) AS saved, "
+                "COALESCE(SUM(real_tokens_in),0) AS real_in, "
+                "COALESCE(SUM(real_tokens_out),0) AS real_out "
+                "FROM requests GROUP BY project ORDER BY saved DESC, requests DESC"
+            ).fetchall()
+            return [
+                {
+                    "project": r["project"] or "unknown",
+                    "requests": r["requests"], "saved": r["saved"],
+                    "real_in": r["real_in"], "real_out": r["real_out"],
+                }
+                for r in rows
+            ]
+        finally:
+            conn.close()
+    except (sqlite3.Error, OSError):
+        return []

@@ -133,6 +133,7 @@ def record_request(
     real_cache_creation: int = 0,
     context_store: bool = False,
     events_fetched: int = 0,
+    project: str = "unknown",
 ) -> None:
     data = load()
     saved = max(0, tokens_before - tokens_after)
@@ -186,6 +187,7 @@ def record_request(
             saved=saved,
             http_status=status,
             ts=now,
+            project=project,
         )
     except Exception:  # noqa: BLE001 - history is strictly best-effort
         pass

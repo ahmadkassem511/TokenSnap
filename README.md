@@ -148,6 +148,37 @@ It runs independently of the proxy, so opening or closing it never interrupts
 request handling — you can leave the proxy running and open the dashboard
 whenever you like.
 
+The dashboard shows your savings at **three levels** at a glance:
+
+- **This Session** — live totals since the proxy last started (from the
+  volatile stats file; resets when you restart the proxy).
+- **All Time** — cumulative totals from the persistent history database, so
+  your lifetime savings survive restarts.
+- **Projects** — a per-project breakdown (see
+  [Project tracking](#project-tracking) below): one card per project with its
+  tokens saved and request count, plus a filter that scopes the savings chart
+  to a single project.
+
+### Project tracking
+
+TokenSnap automatically tags each request with the **project it came from**, so
+the dashboard can break your savings down per project. Tagging is automatic —
+you don't configure anything:
+
+- **From the dashboard:** the folder you pick in the **Project directory** panel
+  (via **Browse…** or by typing a path) becomes the project when you click
+  **Launch Claude Code**.
+- **From a terminal:** `tokensnap run claude` tags the session with the
+  terminal's current working directory.
+
+Under the hood this sets a `TOKENSNAP_PROJECT` environment variable that the
+proxy reads and stores with every request row. Because a single proxy serves
+one project at a time, this is ideal for the common "one project at a time"
+workflow. If you want to track several projects separately, run them
+sequentially (or with a separate proxy per project) rather than concurrently
+through one shared proxy; requests that arrive before any project is set are
+tagged `unknown`.
+
 Both views show two sets of numbers:
 
 - **Est. saved** — Tokensnap's own tiktoken estimate of the request body

@@ -88,6 +88,14 @@ def run(
     cfg = config_mod.load()
     base_url = _base_url(cfg)
 
+    # Tag this session's requests with the current project (its working
+    # directory) so the dashboard can break stats down per project. Set it in
+    # our own environment *before* starting the proxy below, so the detached
+    # proxy - which reads TOKENSNAP_PROJECT from its inherited environment -
+    # picks it up. Respect an existing value (e.g. exported by the dashboard's
+    # launch button); the proxy serves one project at a time.
+    os.environ.setdefault("TOKENSNAP_PROJECT", os.getcwd())
+
     # Resolve `claude` even when it's installed but not on PATH (a common npm
     # global-install situation, especially on Windows). Non-claude commands
     # pass through untouched, so `tokensnap run <anything>` still works.
