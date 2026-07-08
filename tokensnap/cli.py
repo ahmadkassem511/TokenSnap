@@ -146,10 +146,17 @@ def _build_dashboard(cfg: dict) -> Panel:
             format(totals["real_cache_creation"], ","),
         ),
     )
+    ctx_enabled = bool(cfg.get("context_store_enabled", False))
+    ctx_text = (
+        "Differential Context Engine: [bold green]enabled[/bold green] (tree size: %d)"
+        % int(cfg.get("context_tree_size", 20))
+        if ctx_enabled
+        else "Differential Context Engine: [dim]disabled[/dim]"
+    )
     header.add_row(
         "keep_messages: [bold]%d[/bold]" % int(cfg["keep_messages"]),
         "Memory Cards: %s" % (data.get("llm_status") or "not started yet"),
-        "",
+        ctx_text,
     )
 
     table = Table(
@@ -265,6 +272,12 @@ def status() -> None:
             " (since %Y-%m-%d %H:%M:%S)"
         )
     llm_status = data.get("llm_status") or "not started yet"
+    if bool(cfg.get("context_store_enabled", False)):
+        ctx_status = "[bold green]enabled[/bold green] (tree size: %d)" % int(
+            cfg.get("context_tree_size", 20)
+        )
+    else:
+        ctx_status = "disabled"
 
     console.print(
         Panel.fit(
@@ -273,6 +286,7 @@ def status() -> None:
             "Requests handled: %d\n"
             "Compression: keep_messages=%d (last N exchanges kept verbatim)\n"
             "Memory Cards: %s\n"
+            "Differential Context Engine: %s\n"
             "\n[bold]Tokensnap optimization (request body, estimated):[/bold]\n"
             "  before: %s   after: %s\n"
             "  saved:  [bold green]%s[/bold green] ([bold]%.1f%%[/bold])\n"
@@ -286,6 +300,7 @@ def status() -> None:
                 totals["requests"],
                 int(cfg["keep_messages"]),
                 llm_status,
+                ctx_status,
                 format(before, ","),
                 format(totals["tokens_after"], ","),
                 format(saved, ","),

@@ -141,6 +141,8 @@ async def api_stats(request: web.Request) -> web.Response:
         "compressor_type": cfg["compressor_type"],
         "selective_compression": bool(cfg["selective_compression"]),
         "openrouter_api_key_set": bool(str(cfg.get("openrouter_api_key", "")).strip()),
+        "context_store_enabled": bool(cfg.get("context_store_enabled", False)),
+        "context_tree_size": int(cfg.get("context_tree_size", 20)),
         "recent": recent_rows,
     })
 
@@ -510,6 +512,8 @@ def _dashboard_page() -> str:
     <div class='sub'>in / out tokens</div></div>
   <div class='card'><h3>Active model</h3><div class='big' id='c_model' style='font-size:19px'>-</div>
     <div class='sub'>keep_messages = <span id='c_keep'>-</span></div></div>
+  <div class='card'><h3>Context Engine</h3><div class='big' id='c_ctx' style='font-size:19px'>-</div>
+    <div class='sub' id='c_ctx_sub'>-</div></div>
 </div>
 
 <div class='panel'>
@@ -583,6 +587,10 @@ window.onStats=function(s){
   document.getElementById('c_real').textContent=fmt(s.real_input)+' / '+fmt(s.real_output);
   document.getElementById('c_model').textContent=s.active_model||'-';
   document.getElementById('c_keep').textContent=s.keep_messages;
+  document.getElementById('c_ctx').textContent=s.context_store_enabled?'On':'Off';
+  document.getElementById('c_ctx').className='big'+(s.context_store_enabled?' accent':' muted');
+  document.getElementById('c_ctx_sub').textContent=s.context_store_enabled?
+    ('tree size: '+s.context_tree_size):'Memory Card compression in use';
   document.getElementById('llm').textContent=s.llm_status;
   updateLLMPill(s.compressor_type, s.openrouter_api_key_set);
   renderRecent(s.recent||[]);

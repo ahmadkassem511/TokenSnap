@@ -102,6 +102,31 @@ class TestContextEngineDashboard:
         assert "id='ctxenabled'" in html
         assert "Differential Context Engine" in html
 
+    def _stats_json(self):
+        return json.loads(asyncio.run(webui.api_stats(None)).text)
+
+    def test_api_stats_reports_disabled_by_default(self):
+        data = self._stats_json()
+        assert data["context_store_enabled"] is False
+        assert data["context_tree_size"] == 20
+
+    def test_api_stats_reports_enabled_and_custom_tree_size(self):
+        from tokensnap import config as config_mod
+
+        config_mod.set_value("context_store_enabled", "true")
+        config_mod.set_value("context_tree_size", "42")
+        data = self._stats_json()
+        assert data["context_store_enabled"] is True
+        assert data["context_tree_size"] == 42
+
+    def test_dashboard_page_has_context_engine_card(self):
+        html = webui._dashboard_page()
+        assert "id='c_ctx'" in html
+        assert "id='c_ctx_sub'" in html
+        assert "Context Engine" in html
+        # The card is driven by the same /api/stats poll as the other cards.
+        assert "context_store_enabled" in html
+
     def test_registers_openrouter_status_route(self):
         app = webui.build_app()
         paths = {r.resource.canonical for r in app.router.routes()}
