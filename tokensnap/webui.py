@@ -109,6 +109,13 @@ async def api_stats(request: web.Request) -> web.Response:
     pct = 100.0 * saved / before if before else 0.0
     recent = data.get("recent") or []
     active_model = recent[-1]["model"] if recent else "-"
+    # Differential Context Engine one-liner, matching the wording used by
+    # `tokensnap status` / `tokensnap monitor` so all three read the same.
+    ctx_enabled = bool(cfg.get("context_store_enabled", False))
+    context_status = (
+        "enabled (tree size: %d)" % int(cfg.get("context_tree_size", 20))
+        if ctx_enabled else "disabled"
+    )
     # Send the tail newest-first so the table renders without extra work client-side.
     recent_rows = [
         {
@@ -141,8 +148,9 @@ async def api_stats(request: web.Request) -> web.Response:
         "compressor_type": cfg["compressor_type"],
         "selective_compression": bool(cfg["selective_compression"]),
         "openrouter_api_key_set": bool(str(cfg.get("openrouter_api_key", "")).strip()),
-        "context_store_enabled": bool(cfg.get("context_store_enabled", False)),
+        "context_store_enabled": ctx_enabled,
         "context_tree_size": int(cfg.get("context_tree_size", 20)),
+        "context_status": context_status,
         "recent": recent_rows,
     })
 
@@ -512,7 +520,7 @@ def _dashboard_page() -> str:
     <div class='sub'>in / out tokens</div></div>
   <div class='card'><h3>Active model</h3><div class='big' id='c_model' style='font-size:19px'>-</div>
     <div class='sub'>keep_messages = <span id='c_keep'>-</span></div></div>
-  <div class='card'><h3>Context Engine</h3><div class='big' id='c_ctx' style='font-size:19px'>-</div>
+  <div class='card'><h3>Differential Context Engine</h3><div class='big' id='c_ctx' style='font-size:17px'>-</div>
     <div class='sub' id='c_ctx_sub'>-</div></div>
 </div>
 
@@ -587,10 +595,10 @@ window.onStats=function(s){
   document.getElementById('c_real').textContent=fmt(s.real_input)+' / '+fmt(s.real_output);
   document.getElementById('c_model').textContent=s.active_model||'-';
   document.getElementById('c_keep').textContent=s.keep_messages;
-  document.getElementById('c_ctx').textContent=s.context_store_enabled?'On':'Off';
+  document.getElementById('c_ctx').textContent=s.context_status||'-';
   document.getElementById('c_ctx').className='big'+(s.context_store_enabled?' accent':' muted');
   document.getElementById('c_ctx_sub').textContent=s.context_store_enabled?
-    ('tree size: '+s.context_tree_size):'Memory Card compression in use';
+    'sending Context Tree + last exchanges':'using Memory Card compression';
   document.getElementById('llm').textContent=s.llm_status;
   updateLLMPill(s.compressor_type, s.openrouter_api_key_set);
   renderRecent(s.recent||[]);

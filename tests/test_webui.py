@@ -109,6 +109,8 @@ class TestContextEngineDashboard:
         data = self._stats_json()
         assert data["context_store_enabled"] is False
         assert data["context_tree_size"] == 20
+        # Same one-liner wording as `tokensnap status` / `monitor`.
+        assert data["context_status"] == "disabled"
 
     def test_api_stats_reports_enabled_and_custom_tree_size(self):
         from tokensnap import config as config_mod
@@ -118,14 +120,16 @@ class TestContextEngineDashboard:
         data = self._stats_json()
         assert data["context_store_enabled"] is True
         assert data["context_tree_size"] == 42
+        assert data["context_status"] == "enabled (tree size: 42)"
 
     def test_dashboard_page_has_context_engine_card(self):
         html = webui._dashboard_page()
         assert "id='c_ctx'" in html
         assert "id='c_ctx_sub'" in html
-        assert "Context Engine" in html
+        # Label matches the CLI/monitor wording exactly.
+        assert "Differential Context Engine" in html
         # The card is driven by the same /api/stats poll as the other cards.
-        assert "context_store_enabled" in html
+        assert "context_status" in html
 
     def test_registers_openrouter_status_route(self):
         app = webui.build_app()
