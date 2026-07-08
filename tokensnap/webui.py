@@ -21,6 +21,7 @@ the OpenRouter key it *does* accept (to enable smart Memory Cards) is never
 echoed back to the browser once saved - only whether one is set.
 """
 
+import asyncio
 import json
 import os
 import shutil
@@ -315,23 +316,34 @@ def _launch_claude_terminal() -> "tuple[bool, str]":
         "Claude Code launched! A new terminal window should have opened. "
         "You can close this browser tab or keep it open to monitor savings."
     )
+    # Open Claude Code in the folder the dashboard is pointed at. Guard against
+    # a stale directory (e.g. one picked earlier and since deleted) so we fall
+    # back to the default cwd instead of failing the launch outright.
+    launch_dir = get_launch_dir()
+    cwd = launch_dir if os.path.isdir(launch_dir) else None
     py = sys.executable
     inner = '"%s" -m tokensnap run claude' % py
     try:
         if os.name == "nt":
+            # The new console window inherits this cwd, so Claude opens there.
             subprocess.Popen(
-                'start "TokenSnap - Claude Code" cmd /k %s' % inner, shell=True
+                'start "TokenSnap - Claude Code" cmd /k %s' % inner,
+                shell=True, cwd=cwd,
             )
             return True, success_message
         if sys.platform == "darwin":
+            # Terminal.app's `do script` doesn't inherit our cwd, so cd first.
+            script = inner
+            if cwd:
+                script = "cd '%s' && %s" % (cwd.replace("'", "'\\''"), inner)
             subprocess.Popen(
                 ["osascript", "-e",
-                 'tell application "Terminal" to do script "%s"' % inner]
+                 'tell application "Terminal" to do script "%s"' % script]
             )
             return True, success_message
         for term in ("x-terminal-emulator", "gnome-terminal", "konsole", "xterm"):
             if shutil.which(term):
-                subprocess.Popen([term, "-e", "sh", "-c", inner])
+                subprocess.Popen([term, "-e", "sh", "-c", inner], cwd=cwd)
                 return True, success_message
         return False, (
             "Couldn't find a terminal to open. Run this yourself: "
@@ -339,6 +351,110 @@ def _launch_claude_terminal() -> "tuple[bool, str]":
         )
     except Exception as exc:  # noqa: BLE001
         return False, "Couldn't launch a terminal (%s). Run: tokensnap run claude" % exc
+
+
+# ---------------------------------------------------------------------------
+# Project directory (where "Launch Claude Code" opens Claude)
+# ---------------------------------------------------------------------------
+# Defaults to the dashboard's startup working directory; the folder picker or
+# the manual path box on the dashboard can override it for later launches.
+_launch_dir = os.getcwd()
+
+
+def get_launch_dir() -> str:
+    return _launch_dir
+
+
+def set_launch_dir(path: str) -> bool:
+    """Point future launches at `path` if it's an existing directory. Returns
+    True on success, False if the path is empty, missing, or not a directory."""
+    global _launch_dir
+    if not path or not os.path.isdir(path):
+        return False
+    _launch_dir = os.path.abspath(path)
+    return True
+
+
+# A standalone script so the native folder dialog runs in its own process (its
+# own main thread - required by tkinter/Cocoa) instead of blocking the
+# dashboard's asyncio event loop or fighting it for the main thread.
+_FOLDER_PICKER_SCRIPT = (
+    "import sys\n"
+    "import tkinter as tk\n"
+    "from tkinter import filedialog\n"
+    "root = tk.Tk()\n"
+    "root.withdraw()\n"
+    "root.attributes('-topmost', True)\n"
+    "path = filedialog.askdirectory(title='Select a project folder for Claude Code')\n"
+    "root.destroy()\n"
+    "sys.stdout.write(path or '')\n"
+)
+
+
+def _pick_folder_native(timeout: float = 300.0):
+    """Open a native folder picker in a subprocess. Returns (path, error):
+      * (path, None)  - a folder was chosen
+      * (None, None)  - the user cancelled the dialog
+      * (None, error) - the picker couldn't run (headless / no tkinter)
+    Blocking; call it via run_in_executor so the event loop stays responsive.
+    """
+    popen_kwargs: Dict[str, Any] = {}
+    if os.name == "nt":
+        # Show the Tk dialog without also flashing a console window.
+        popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-c", _FOLDER_PICKER_SCRIPT],
+            capture_output=True, text=True, timeout=timeout, **popen_kwargs,
+        )
+    except subprocess.TimeoutExpired:
+        return None, "The folder picker timed out."
+    except (OSError, subprocess.SubprocessError) as exc:
+        return None, "Couldn't open a folder picker (%s)." % exc
+    if proc.returncode != 0:
+        # tkinter missing, or no display (a headless server).
+        return None, (
+            "A native folder picker isn't available here - type or paste a "
+            "path instead."
+        )
+    path = (proc.stdout or "").strip()
+    return (path or None), None
+
+
+async def browse_folder(request: web.Request) -> web.Response:
+    """Open a native folder picker and remember the chosen directory for
+    subsequent launches. Runs the blocking dialog off the event loop so the
+    dashboard stays responsive while it's open."""
+    loop = asyncio.get_running_loop()
+    path, error = await loop.run_in_executor(None, _pick_folder_native)
+    if error:
+        return web.json_response({"path": None, "error": error})
+    if path:
+        set_launch_dir(path)
+    return web.json_response({"path": path})
+
+
+async def get_project_dir(request: web.Request) -> web.Response:
+    """Return the directory the dashboard will launch Claude Code in."""
+    return web.json_response({"path": get_launch_dir()})
+
+
+async def set_project_dir(request: web.Request) -> web.Response:
+    """Set the launch directory from a manually entered path, validating that
+    it exists and is a directory on the server's filesystem before accepting."""
+    try:
+        body = await request.json()
+    except (json.JSONDecodeError, ValueError):
+        body = {}
+    path = str((body or {}).get("path") or "").strip()
+    if not path:
+        return web.json_response({"ok": False, "error": "No path provided."})
+    if not os.path.isdir(path):
+        return web.json_response(
+            {"ok": False, "error": "That path doesn't exist or isn't a folder."}
+        )
+    set_launch_dir(path)
+    return web.json_response({"ok": True, "path": get_launch_dir()})
 
 
 # ---------------------------------------------------------------------------
@@ -358,6 +474,9 @@ def build_app() -> web.Application:
     app.router.add_get("/settings", settings_page)
     app.router.add_post("/settings/save", settings_save)
     app.router.add_post("/launch", launch)
+    app.router.add_post("/browse-folder", browse_folder)
+    app.router.add_get("/get-project-dir", get_project_dir)
+    app.router.add_post("/set-project-dir", set_project_dir)
     return app
 
 
@@ -554,8 +673,22 @@ def _dashboard_page() -> str:
 
 <div class='panel'>
   <div style='display:flex;align-items:center;gap:14px;flex-wrap:wrap'>
-    <h2 style='margin:0'>Live proxy log</h2>
+    <h2 style='margin:0'>Project directory</h2>
     <button class='btn primary' id='launchbtn' style='margin-left:auto'>Launch Claude Code</button>
+  </div>
+  <p class='sub muted' style='margin:6px 0 12px'>Claude Code opens in this folder when you launch it from here.
+    (Running <b>tokensnap run claude</b> in a terminal still uses that terminal's own folder.)</p>
+  <div style='display:flex;gap:10px;flex-wrap:wrap;align-items:center'>
+    <input type='text' id='projdir' style='flex:1;min-width:260px' placeholder='/path/to/your/project'>
+    <button class='btn' id='browsebtn'>Browse&hellip;</button>
+    <button class='btn' id='setdirbtn'>Set</button>
+  </div>
+  <div class='sub muted' id='projdirmsg' style='margin-top:8px'>Loading&hellip;</div>
+</div>
+
+<div class='panel'>
+  <div style='display:flex;align-items:center;gap:14px;flex-wrap:wrap'>
+    <h2 style='margin:0'>Live proxy log</h2>
   </div>
   <div class='log' id='log' style='margin-top:12px'>waiting for the proxy...</div>
   <div class='sub muted' style='margin-top:8px'>Memory Cards:
@@ -641,12 +774,56 @@ async function loadLog(){
     if(atBottom)el.scrollTop=el.scrollHeight;
   }catch(e){}
 }
+function setProjMsg(msg, ok){
+  var el=document.getElementById('projdirmsg');
+  el.textContent=msg;el.style.color=ok?'var(--muted)':'var(--danger)';
+}
+async function loadProjectDir(){
+  try{
+    var r=await (await fetch('/get-project-dir')).json();
+    if(r.path){document.getElementById('projdir').value=r.path;
+      setProjMsg('Claude Code will launch in: '+r.path,true);}
+  }catch(e){setProjMsg('Could not read the current folder.',false);}
+}
+// Validate + persist whatever path is in the box. Returns true when the
+// server accepts it (path exists and is a directory); disables Launch if not.
+async function applyProjectDir(showToast){
+  var path=document.getElementById('projdir').value.trim();
+  try{
+    var r=await (await fetch('/set-project-dir',{method:'POST',
+      headers:{'Content-Type':'application/json'},body:JSON.stringify({path:path})})).json();
+    document.getElementById('launchbtn').disabled=!r.ok;
+    if(r.ok){document.getElementById('projdir').value=r.path;
+      setProjMsg('Claude Code will launch in: '+r.path,true);
+      if(showToast)toast('Project folder set');}
+    else{setProjMsg(r.error||'Invalid folder.',false);}
+    return !!r.ok;
+  }catch(e){setProjMsg('Could not set the folder.',false);return false;}
+}
+document.getElementById('setdirbtn').onclick=function(){applyProjectDir(true);};
+document.getElementById('browsebtn').onclick=async function(){
+  var self=this,old=self.textContent;self.disabled=true;self.textContent='Opening\\u2026';
+  setProjMsg('A folder picker should have opened - choose a folder.',true);
+  try{
+    var r=await (await fetch('/browse-folder',{method:'POST'})).json();
+    if(r.error){setProjMsg(r.error,false);document.getElementById('projdir').focus();}
+    else if(r.path){document.getElementById('projdir').value=r.path;
+      document.getElementById('launchbtn').disabled=false;
+      setProjMsg('Claude Code will launch in: '+r.path,true);toast('Folder selected');}
+    else{setProjMsg('Folder selection cancelled.',true);}
+  }catch(e){setProjMsg('Folder picker failed.',false);}
+  self.disabled=false;self.textContent=old;
+};
 document.getElementById('launchbtn').onclick=async function(){
   var self=this;self.disabled=true;
+  // Make sure the backend launches in whatever path is shown, validating it.
+  var ok=await applyProjectDir(false);
+  if(!ok){self.disabled=false;toast('Set a valid project folder first');return;}
   try{var r=await (await fetch('/launch',{method:'POST'})).json();toast(r.message||'Launched');}
   catch(e){toast('Launch failed');}
   setTimeout(function(){self.disabled=false;},2500);
 };
+loadProjectDir();
 setTimeout(loadChart,300);setInterval(loadChart,15000);
 loadLog();setInterval(loadLog,3000);
 loadORStatus();setInterval(loadORStatus,10000);

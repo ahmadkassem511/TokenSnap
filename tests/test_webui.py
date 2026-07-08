@@ -8,6 +8,7 @@ monkeypatch the already-resolved module attributes.
 
 import asyncio
 import json
+import os
 import re
 
 import pytest
@@ -444,3 +445,139 @@ class TestPageRendering:
             btn_pos = html.index("id='launchClaudeBtn'")
             script_pos = html.rindex("<script>")
             assert btn_pos < script_pos
+
+
+class _FakeJsonRequest:
+    """Minimal stand-in for web.Request exposing an async .json() body."""
+
+    def __init__(self, payload):
+        self._payload = payload
+
+    async def json(self):
+        return self._payload
+
+
+class TestProjectDirEndpoints:
+    @pytest.fixture(autouse=True)
+    def restore_launch_dir(self):
+        # The launch dir is module-global state; snapshot and restore it so
+        # these tests never leak a (possibly since-deleted) path into others.
+        saved = webui.get_launch_dir()
+        yield
+        webui._launch_dir = saved
+
+    def test_routes_registered(self):
+        app = webui.build_app()
+        paths = {r.resource.canonical for r in app.router.routes()}
+        assert "/browse-folder" in paths
+        assert "/get-project-dir" in paths
+        assert "/set-project-dir" in paths
+
+    def test_get_project_dir_returns_current(self, tmp_path):
+        webui.set_launch_dir(str(tmp_path))
+        data = json.loads(asyncio.run(webui.get_project_dir(None)).text)
+        assert data["path"] == webui.get_launch_dir()
+
+    def test_set_project_dir_accepts_existing_directory(self, tmp_path):
+        resp = asyncio.run(webui.set_project_dir(_FakeJsonRequest({"path": str(tmp_path)})))
+        data = json.loads(resp.text)
+        assert data["ok"] is True
+        assert webui.get_launch_dir() == os.path.abspath(str(tmp_path))
+
+    def test_set_project_dir_rejects_missing_path(self, tmp_path):
+        before = webui.get_launch_dir()
+        missing = str(tmp_path / "does-not-exist")
+        resp = asyncio.run(webui.set_project_dir(_FakeJsonRequest({"path": missing})))
+        data = json.loads(resp.text)
+        assert data["ok"] is False
+        assert "error" in data
+        assert webui.get_launch_dir() == before  # unchanged
+
+    def test_set_project_dir_rejects_a_file(self, tmp_path):
+        f = tmp_path / "afile.txt"
+        f.write_text("x", encoding="utf-8")
+        resp = asyncio.run(webui.set_project_dir(_FakeJsonRequest({"path": str(f)})))
+        assert json.loads(resp.text)["ok"] is False
+
+    def test_set_project_dir_rejects_empty(self):
+        resp = asyncio.run(webui.set_project_dir(_FakeJsonRequest({"path": ""})))
+        assert json.loads(resp.text)["ok"] is False
+
+    def test_browse_folder_success_updates_launch_dir(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(webui, "_pick_folder_native", lambda: (str(tmp_path), None))
+        data = json.loads(asyncio.run(webui.browse_folder(None)).text)
+        assert data["path"] == str(tmp_path)
+        assert webui.get_launch_dir() == os.path.abspath(str(tmp_path))
+
+    def test_browse_folder_cancel_returns_null_path(self, monkeypatch):
+        before = webui.get_launch_dir()
+        monkeypatch.setattr(webui, "_pick_folder_native", lambda: (None, None))
+        data = json.loads(asyncio.run(webui.browse_folder(None)).text)
+        assert data["path"] is None
+        assert webui.get_launch_dir() == before  # cancel leaves it unchanged
+
+    def test_browse_folder_error_is_reported(self, monkeypatch):
+        monkeypatch.setattr(
+            webui, "_pick_folder_native", lambda: (None, "no display here")
+        )
+        data = json.loads(asyncio.run(webui.browse_folder(None)).text)
+        assert data["path"] is None
+        assert data["error"] == "no display here"
+
+    def test_dashboard_page_has_project_dir_ui(self):
+        html = webui._dashboard_page()
+        assert "id='projdir'" in html
+        assert "id='browsebtn'" in html
+        assert "id='setdirbtn'" in html
+        assert "Project directory" in html
+        # Wired to the new endpoints.
+        assert "/browse-folder" in html
+        assert "/set-project-dir" in html
+        assert "/get-project-dir" in html
+
+
+class TestLaunchUsesProjectDir:
+    @pytest.fixture(autouse=True)
+    def isolated(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(webui.config_mod, "CONFIG_DIR", tmp_path)
+        monkeypatch.setattr(webui.config_mod, "CONFIG_FILE", tmp_path / "config.json")
+        monkeypatch.setattr(webui, "resolve_claude_command", lambda cmd: list(cmd))
+        monkeypatch.setattr(webui.stats, "proxy_running", lambda *a, **k: True)
+        # Every terminal branch needs a hit on Linux CI (no real emulator).
+        known = {"x-terminal-emulator", "gnome-terminal", "konsole", "xterm"}
+        monkeypatch.setattr(
+            webui.shutil, "which",
+            lambda name: ("/usr/bin/" + name) if name in known else None,
+        )
+        saved = webui.get_launch_dir()
+        yield
+        webui._launch_dir = saved
+
+    def test_launch_passes_selected_dir_as_cwd(self, tmp_path, monkeypatch):
+        calls = {}
+        monkeypatch.setattr(
+            webui.subprocess, "Popen",
+            lambda *a, **k: calls.update(a=a, k=k) or None,
+        )
+        proj = tmp_path / "myproject"
+        proj.mkdir()
+        assert webui.set_launch_dir(str(proj)) is True
+        ok, _ = webui._launch_claude_terminal()
+        assert ok is True
+        # The chosen folder is handed to the terminal as its working directory.
+        assert calls["k"].get("cwd") == webui.get_launch_dir()
+
+    def test_launch_falls_back_to_none_cwd_for_stale_dir(self, tmp_path, monkeypatch):
+        calls = {}
+        monkeypatch.setattr(
+            webui.subprocess, "Popen",
+            lambda *a, **k: calls.update(k=k) or None,
+        )
+        # Point at a directory, then delete it so it's stale at launch time.
+        gone = tmp_path / "gone"
+        gone.mkdir()
+        webui.set_launch_dir(str(gone))
+        gone.rmdir()
+        ok, _ = webui._launch_claude_terminal()
+        assert ok is True
+        assert calls["k"].get("cwd") is None  # guarded fallback, no crash
