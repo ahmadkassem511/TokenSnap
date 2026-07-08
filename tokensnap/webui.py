@@ -33,7 +33,7 @@ from typing import Any, Dict, List
 
 from aiohttp import web
 
-from tokensnap import __version__, context_store, history, openrouter, stats
+from tokensnap import __version__, context_store, history, openrouter, project, stats
 from tokensnap import config as config_mod
 from tokensnap.utils import resolve_claude_command
 
@@ -367,10 +367,11 @@ def _launch_claude_terminal() -> "tuple[bool, str]":
         return False, _CLAUDE_INSTALL_HINT
 
     # Tag this session's requests with the selected project folder so the
-    # dashboard's per-project stats attribute them correctly. Set before
-    # starting the proxy so the detached proxy inherits it (it reads
-    # TOKENSNAP_PROJECT from its environment); `tokensnap run claude` in the
-    # spawned terminal keeps this same value via os.environ.setdefault.
+    # dashboard's per-project stats attribute them correctly. The proxy reads
+    # this per request from a state file, so it works even against a proxy
+    # that's already running. The env var is set too as a fallback for a proxy
+    # freshly started from this process's environment.
+    project.set_current_project(get_launch_dir())
     os.environ["TOKENSNAP_PROJECT"] = get_launch_dir()
 
     if not stats.proxy_running(*_proxy_host_port()):

@@ -24,10 +24,14 @@ def _free_port() -> int:
 
 @pytest.fixture(autouse=True)
 def isolated(tmp_path, monkeypatch):
+    from tokensnap import project as project_mod
+
     monkeypatch.setattr(config_mod, "CONFIG_DIR", tmp_path)
     monkeypatch.setattr(config_mod, "CONFIG_FILE", tmp_path / "config.json")
     monkeypatch.setattr(stats, "STATS_DIR", tmp_path)
     monkeypatch.setattr(stats, "STATS_FILE", tmp_path / "stats.json")
+    # `run` records the current project; keep it off the real state file.
+    monkeypatch.setattr(project_mod, "PROJECT_FILE", tmp_path / "current_project")
     defaults = dict(config_mod.DEFAULTS)
     defaults["port"] = _free_port()
     monkeypatch.setattr(config_mod, "DEFAULTS", defaults)
@@ -50,6 +54,19 @@ def test_run_resolves_claude_and_launches(monkeypatch):
     assert result.exit_code == 0
     # The resolved absolute path (not bare "claude") is what actually runs.
     assert "/abs/bin/claude" in str(calls["cmd"])
+
+
+def test_run_records_current_project(monkeypatch):
+    from tokensnap import project as project_mod
+
+    monkeypatch.delenv("TOKENSNAP_PROJECT", raising=False)
+    monkeypatch.setattr(cli, "resolve_claude_command", lambda command: list(command))
+    monkeypatch.setattr(cli.subprocess, "call", lambda *a, **k: 0)
+    runner.invoke(cli.app, ["run", "claude"])
+    # `run` tags this session's project as the cwd, so the proxy attributes
+    # its requests correctly (read per request from the state file).
+    import os
+    assert project_mod.get_current_project() == os.getcwd()
 
 
 def test_run_errors_when_claude_missing(monkeypatch):

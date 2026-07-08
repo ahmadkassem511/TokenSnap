@@ -171,13 +171,13 @@ you don't configure anything:
 - **From a terminal:** `tokensnap run claude` tags the session with the
   terminal's current working directory.
 
-Under the hood this sets a `TOKENSNAP_PROJECT` environment variable that the
-proxy reads and stores with every request row. Because a single proxy serves
-one project at a time, this is ideal for the common "one project at a time"
-workflow. If you want to track several projects separately, run them
-sequentially (or with a separate proxy per project) rather than concurrently
-through one shared proxy; requests that arrive before any project is set are
-tagged `unknown`.
+Under the hood each launch records the project in a small state file
+(`~/.tokensnap/current_project`) that the proxy reads with **every request**,
+so switching projects takes effect immediately — you don't need to restart the
+long-running proxy. Sequential single-project use is exact. For genuinely
+concurrent sessions through one shared proxy the most recent launch wins (the
+proxy has no per-request signal to tell two live Claude Code sessions apart);
+requests handled before any project is set are tagged `unknown`.
 
 Both views show two sets of numbers:
 

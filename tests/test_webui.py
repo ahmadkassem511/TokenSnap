@@ -271,6 +271,13 @@ class TestApplySettingsFallbackModels:
 
 
 class TestLaunchClaudeTerminal:
+    @pytest.fixture(autouse=True)
+    def isolate_project_file(self, tmp_path, monkeypatch):
+        # Launching now writes the current-project state file; keep it off the
+        # real ~/.tokensnap/current_project.
+        monkeypatch.setattr(webui.project, "PROJECT_FILE", tmp_path / "current_project")
+        yield
+
     def test_claude_not_installed_returns_install_hint(self, monkeypatch):
         # Claude can't be resolved any way (not on PATH, no npm global, no npx).
         monkeypatch.setattr(webui, "resolve_claude_command", lambda cmd: None)
@@ -541,6 +548,7 @@ class TestLaunchUsesProjectDir:
     def isolated(self, tmp_path, monkeypatch):
         monkeypatch.setattr(webui.config_mod, "CONFIG_DIR", tmp_path)
         monkeypatch.setattr(webui.config_mod, "CONFIG_FILE", tmp_path / "config.json")
+        monkeypatch.setattr(webui.project, "PROJECT_FILE", tmp_path / "current_project")
         monkeypatch.setattr(webui, "resolve_claude_command", lambda cmd: list(cmd))
         monkeypatch.setattr(webui.stats, "proxy_running", lambda *a, **k: True)
         # Every terminal branch needs a hit on Linux CI (no real emulator).
@@ -582,15 +590,17 @@ class TestLaunchUsesProjectDir:
         assert ok is True
         assert calls["k"].get("cwd") is None  # guarded fallback, no crash
 
-    def test_launch_exports_project_env(self, tmp_path, monkeypatch):
+    def test_launch_records_current_project(self, tmp_path, monkeypatch):
         monkeypatch.setattr(webui.subprocess, "Popen", lambda *a, **k: None)
         monkeypatch.delenv("TOKENSNAP_PROJECT", raising=False)
         proj = tmp_path / "tagged"
         proj.mkdir()
         webui.set_launch_dir(str(proj))
         webui._launch_claude_terminal()
-        # The proxy (started with this environment) reads TOKENSNAP_PROJECT to
-        # tag its request rows; it must match the selected launch dir.
+        # The proxy reads the current-project state file per request to tag
+        # its rows; the launch must have written the selected folder there.
+        assert webui.project.get_current_project() == webui.get_launch_dir()
+        # And the env var is still set as a fallback.
         assert os.environ["TOKENSNAP_PROJECT"] == webui.get_launch_dir()
 
 

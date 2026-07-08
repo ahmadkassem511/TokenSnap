@@ -89,11 +89,13 @@ def run(
     base_url = _base_url(cfg)
 
     # Tag this session's requests with the current project (its working
-    # directory) so the dashboard can break stats down per project. Set it in
-    # our own environment *before* starting the proxy below, so the detached
-    # proxy - which reads TOKENSNAP_PROJECT from its inherited environment -
-    # picks it up. Respect an existing value (e.g. exported by the dashboard's
-    # launch button); the proxy serves one project at a time.
+    # directory) so the dashboard can break stats down per project. The proxy
+    # reads this per request from a state file, so tagging works even against
+    # an already-running proxy (no restart needed). The env var is set too as a
+    # fallback for a proxy freshly started from this environment.
+    from tokensnap import project as project_mod
+
+    project_mod.set_current_project(os.getcwd())
     os.environ.setdefault("TOKENSNAP_PROJECT", os.getcwd())
 
     # Resolve `claude` even when it's installed but not on PATH (a common npm

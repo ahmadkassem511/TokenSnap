@@ -11,7 +11,6 @@ import asyncio
 import hashlib
 import json
 import logging
-import os
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -23,6 +22,7 @@ from tokensnap import (
     compressor,
     context_engine,
     fetch_context,
+    project,
     stats,
     token_counter,
 )
@@ -366,11 +366,11 @@ class TokensnapProxy:
                 real_cache_creation=usage.cache_creation_tokens,
                 context_store=bool(meta.get("context_store")),
                 events_fetched=int(meta.get("events_fetched") or 0),
-                # Tags each row with the project this proxy was launched under
-                # (TOKENSNAP_PROJECT, set by `tokensnap run` / the dashboard's
-                # launch button). A proxy serves one project at a time, so this
-                # is fixed for the life of the process; defaults to 'unknown'.
-                project=os.environ.get("TOKENSNAP_PROJECT", "unknown"),
+                # Tag each row with the current project. Read per request from a
+                # small state file (written by `tokensnap run` / the dashboard's
+                # launch button), so switching projects works without restarting
+                # this long-running proxy. Defaults to 'unknown'.
+                project=project.get_current_project(),
             )
         else:
             log.info(
