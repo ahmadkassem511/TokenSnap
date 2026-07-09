@@ -35,6 +35,7 @@ from aiohttp import web
 
 from tokensnap import __version__, context_store, history, openrouter, project, stats
 from tokensnap import config as config_mod
+from tokensnap import project_primer
 from tokensnap.utils import resolve_claude_command
 
 DEFAULT_PORT = 9876
@@ -86,6 +87,7 @@ def _public_config() -> Dict[str, Any]:
         "openrouter_api_key_set": bool(str(cfg.get("openrouter_api_key", "")).strip()),
         "context_store_enabled": bool(cfg.get("context_store_enabled", False)),
         "context_tree_size": int(cfg.get("context_tree_size", 20)),
+        "project_primer_enabled": bool(cfg.get("project_primer_enabled", True)),
     }
 
 
@@ -242,6 +244,16 @@ async def api_context(request: web.Request) -> web.Response:
     })
 
 
+async def api_primer(request: web.Request) -> web.Response:
+    """Project Primer status for the dashboard/settings panel: whether it's on
+    and the most recently generated Project Card (persisted by the proxy)."""
+    cfg = config_mod.load()
+    return web.json_response({
+        "enabled": bool(cfg.get("project_primer_enabled", True)),
+        "card": project_primer.load_last_card(),
+    })
+
+
 async def api_openrouter_status(request: web.Request) -> web.Response:
     """OpenRouter model/fallback/rate-limit status, for the Settings page
     and the Dashboard's Memory Cards indicator."""
@@ -297,7 +309,8 @@ async def _apply_settings(request: web.Request) -> Dict[str, Any]:
 
     saved: Dict[str, Any] = {}
     for key in ("keep_messages", "selective_compression", "compressor_type",
-                "openrouter_model", "context_store_enabled", "context_tree_size"):
+                "openrouter_model", "context_store_enabled", "context_tree_size",
+                "project_primer_enabled"):
         if key not in body or body[key] in (None, ""):
             continue
         try:
@@ -539,6 +552,7 @@ def build_app() -> web.Application:
     app.router.add_get("/api/log", api_log)
     app.router.add_get("/api/openrouter-status", api_openrouter_status)
     app.router.add_get("/api/context", api_context)
+    app.router.add_get("/api/primer", api_primer)
     app.router.add_get("/setup", setup_page)
     app.router.add_post("/setup/save", setup_save)
     app.router.add_get("/settings", settings_page)
@@ -791,6 +805,17 @@ def _dashboard_page() -> str:
 
 <div class='panel'>
   <div style='display:flex;align-items:center;gap:14px;flex-wrap:wrap'>
+    <h2 style='margin:0'>Project Primer</h2>
+    <span id='primerpill' class='pill' style='margin-left:auto'><span class='dot'></span><span id='primertext'>&hellip;</span></span>
+  </div>
+  <p class='sub muted' style='margin:6px 0 10px'>On the first request of each session, TokenSnap injects a compact overview of
+    your project (language, framework, structure, git state, README) into the system prompt, so Claude understands the
+    codebase immediately. Below is the most recently generated Project Card.</p>
+  <pre class='log' id='primercard' style='height:auto;max-height:260px'>No card generated yet &mdash; launch Claude Code from a project folder.</pre>
+</div>
+
+<div class='panel'>
+  <div style='display:flex;align-items:center;gap:14px;flex-wrap:wrap'>
     <h2 style='margin:0'>Live proxy log</h2>
   </div>
   <div class='log' id='log' style='margin-top:12px'>waiting for the proxy...</div>
@@ -990,9 +1015,32 @@ document.getElementById('launchbtn').onclick=async function(){
   catch(e){toast('Launch failed');}
   setTimeout(function(){self.disabled=false;},2500);
 };
+var PRIMER_ORDER=['project_name','language','framework','key_dependencies',
+  'folder_structure','git_branch','last_commit_summary','modified_files','readme_summary'];
+async function loadPrimer(){
+  try{
+    var p=await (await fetch('/api/primer')).json();
+    var pill=document.getElementById('primerpill'), t=document.getElementById('primertext');
+    pill.className='pill'+(p.enabled?' on':'');t.textContent=p.enabled?'enabled':'disabled';
+    var el=document.getElementById('primercard');
+    if(p.card){
+      var lines=[];
+      PRIMER_ORDER.forEach(function(k){
+        var v=p.card[k];
+        if(v==null||v===''||(Array.isArray(v)&&!v.length))return;
+        if(Array.isArray(v))v=v.join(', ');
+        lines.push(k+': '+v);
+      });
+      el.textContent=lines.length?lines.join('\\n'):'(empty card)';
+    }else{
+      el.textContent='No card generated yet \\u2014 launch Claude Code from a project folder.';
+    }
+  }catch(e){}
+}
 loadProjectDir();
 loadAllTime();setInterval(loadAllTime,15000);
 loadProjects();setInterval(loadProjects,15000);
+loadPrimer();setInterval(loadPrimer,10000);
 setTimeout(loadChart,300);setInterval(loadChart,15000);
 loadLog();setInterval(loadLog,3000);
 loadORStatus();setInterval(loadORStatus,10000);
@@ -1156,6 +1204,19 @@ def _settings_page() -> str:
     <div id='ctxstats' class='sub' style='margin-top:10px'>Loading&hellip;</div>
   </div>
 
+  <div class='panel' style='margin-top:18px;padding:14px 18px'>
+    <div style='font-size:12.5px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;margin-bottom:8px'>
+      Project Primer</div>
+    <p class='sub' style='margin-top:0'>Injects a compact project overview (language, framework, folder structure, git
+      branch/last commit, README summary) into the system prompt on the first request of each session, so Claude
+      understands your codebase immediately. Generated once per session from the current project folder.</p>
+    <label class='f'>Project Primer</label>
+    <select id='primerenabled'>
+      <option value='true'>on &mdash; inject a project overview at session start (default)</option>
+      <option value='false'>off &mdash; no project overview</option>
+    </select>
+  </div>
+
   <div style='display:flex;gap:12px;margin-top:24px;flex-wrap:wrap'>
     <button class='btn primary lg' id='save'>Save settings</button>
     <button class='btn lg' id='launchClaudeBtn'>&#128640; Launch Claude Code with current settings</button>
@@ -1182,6 +1243,7 @@ document.getElementById('fallback').value=(cfg.openrouter_fallback_models||[]).j
 document.getElementById('keystatus').textContent=cfg.openrouter_api_key_set?'(a key is set)':'(no key set)';
 document.getElementById('ctxenabled').value=cfg.context_store_enabled?'true':'false';
 document.getElementById('ctxtree').value=cfg.context_tree_size||20;
+document.getElementById('primerenabled').value=(cfg.project_primer_enabled===false)?'false':'true';
 async function loadCtxStatus(){
   var el=document.getElementById('ctxstats');
   try{
@@ -1228,7 +1290,8 @@ document.getElementById('save').onclick=async function(){
     openrouter_model:document.getElementById('model').value.trim(),
     openrouter_fallback_models:document.getElementById('fallback').value.trim(),
     context_store_enabled:document.getElementById('ctxenabled').value,
-    context_tree_size:parseInt(document.getElementById('ctxtree').value,10)||20};
+    context_tree_size:parseInt(document.getElementById('ctxtree').value,10)||20,
+    project_primer_enabled:document.getElementById('primerenabled').value};
   var key=document.getElementById('apikey').value.trim();
   if(clearKeyRequested)payload.clear_key=true;
   else if(key)payload.openrouter_api_key=key;

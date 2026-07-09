@@ -162,3 +162,59 @@ class TestDifferentialContextPath:
         new_body, _ = optimize_body(body, _cfg(context_store_enabled=True))
         names = [t["name"] for t in new_body["tools"]]
         assert names == ["Bash", "Read", "fetch_context"]
+
+
+class TestProjectPrimer:
+    """The primer injects a project overview on the first request of a session.
+    conftest keeps the project state isolated; here we point it at a temp
+    project so the primer has something real to scan."""
+
+    @pytest.fixture(autouse=True)
+    def temp_project(self, tmp_path, monkeypatch):
+        from tokensnap import project, project_primer
+
+        monkeypatch.setattr(context_store, "DB_FILE", tmp_path / "context_store.db")
+        (tmp_path / "pyproject.toml").write_text(
+            'dependencies = ["flask"]\n', encoding="utf-8"
+        )
+        project.set_current_project(str(tmp_path))
+        project_primer.reset_cache()
+        yield
+
+    def _has_primer(self, new_body):
+        system = new_body.get("system") or ""
+        return "PROJECT PRIMER" in (system if isinstance(system, str) else str(system))
+
+    def test_injected_on_first_request_only(self):
+        body = {"model": "claude-sonnet-5",
+                "system": "base", "messages": _long_history(1)}
+        nb1, m1 = optimize_body(dict(body), _cfg())
+        assert m1["primed"] is True
+        assert self._has_primer(nb1)
+        # Same conversation again -> already primed, not re-injected.
+        nb2, m2 = optimize_body(dict(body), _cfg())
+        assert m2["primed"] is False
+        assert not self._has_primer(nb2)
+
+    def test_disabled_toggle_skips_injection(self):
+        body = {"model": "claude-sonnet-5",
+                "system": "base", "messages": _long_history(1)}
+        nb, m = optimize_body(body, _cfg(project_primer_enabled=False))
+        assert m["primed"] is False
+        assert not self._has_primer(nb)
+
+    def test_injected_in_differential_path_too(self):
+        body = {"model": "claude-sonnet-5",
+                "system": "base", "messages": _long_history(20)}
+        nb, m = optimize_body(body, _cfg(context_store_enabled=True))
+        assert m["primed"] is True
+        assert self._has_primer(nb)
+
+    def test_unknown_project_is_not_primed(self):
+        from tokensnap import project
+
+        project.set_current_project("")  # clears -> get_current_project == 'unknown'
+        body = {"model": "claude-sonnet-5",
+                "system": "base", "messages": _long_history(1)}
+        _, m = optimize_body(body, _cfg())
+        assert m["primed"] is False

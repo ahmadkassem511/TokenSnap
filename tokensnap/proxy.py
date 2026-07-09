@@ -23,6 +23,7 @@ from tokensnap import (
     context_engine,
     fetch_context,
     project,
+    project_primer,
     stats,
     token_counter,
 )
@@ -95,6 +96,29 @@ def _truncate_system(system: Any) -> Any:
     )
 
 
+def _maybe_add_primer(
+    system: Any, session_id: str, cfg: Dict[str, Any]
+) -> Tuple[Any, bool]:
+    """On the first request of a session, add the Project Primer card to the
+    system prompt so Claude understands the codebase from the start.
+
+    Returns ``(system, added)``. A no-op when the primer is disabled, when the
+    current project directory is unknown, or on later requests of the same
+    session (``prime_for_session`` returns None in those cases). Never raises.
+    """
+    if not bool(cfg.get("project_primer_enabled", True)):
+        return system, False
+    try:
+        card = project_primer.prime_for_session(
+            session_id, project.get_current_project(), cfg
+        )
+    except Exception:  # noqa: BLE001 - the primer must never break a request
+        return system, False
+    if not card:
+        return system, False
+    return append_to_system(system, project_primer.format_card(card)), True
+
+
 def optimize_body(
     body: Dict[str, Any], cfg: Dict[str, Any]
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
@@ -109,13 +133,17 @@ def optimize_body(
 
     system = body.get("system")
     tokens_before = token_counter.count_message_tokens(messages, system)
+    # Stable id for this conversation, used to prime it exactly once.
+    primer_session = context_engine.derive_session_id(system, messages)
 
     # Differential Context Engine: instead of a Memory Card, mirror the whole
     # conversation to the local Context Store and send only the last couple of
     # exchanges plus a compact Context Tree (+ a fetch_context tool). Opt-in;
     # when disabled the classic clean+compress path below runs unchanged.
     if bool(cfg.get("context_store_enabled", False)):
-        return _optimize_differential(body, messages, system, model, tokens_before, cfg)
+        return _optimize_differential(
+            body, messages, system, model, tokens_before, cfg, primer_session
+        )
 
     # 1. Clean terminal noise out of every text payload
     messages = _clean_messages(messages)
@@ -163,6 +191,12 @@ def optimize_body(
         system = _truncate_system(system)
         tokens_after = token_counter.count_message_tokens(messages, system)
 
+    # Project Primer: seed the first request of a session with a project
+    # overview. Added after compression so it's never truncated away.
+    system, primed = _maybe_add_primer(system, primer_session, cfg)
+    if primed:
+        tokens_after = token_counter.count_message_tokens(messages, system)
+
     new_body = dict(body)
     new_body["messages"] = messages
     if system is not None:
@@ -176,6 +210,7 @@ def optimize_body(
         "compressed": card is not None,
         "n_messages": len(body.get("messages") or []),
         "n_kept": len(messages),
+        "primed": primed,
     }
     return new_body, meta
 
@@ -187,6 +222,7 @@ def _optimize_differential(
     model: Any,
     tokens_before: int,
     cfg: Dict[str, Any],
+    primer_session: str,
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """Differential Context Engine path (context_store_enabled).
 
@@ -209,6 +245,10 @@ def _optimize_differential(
         selective=bool(cfg.get("selective_compression", True)),
     )
 
+    # Project Primer: seed the first request of a session with a project
+    # overview, added to the (already rewritten) Context Tree system prompt.
+    new_system, primed = _maybe_add_primer(new_system, primer_session, cfg)
+
     new_body = dict(body)
     new_body["messages"] = new_messages
     if new_system is not None:
@@ -229,6 +269,7 @@ def _optimize_differential(
         "n_kept": len(new_messages),
         "context_store": True,
         "events_omitted": n_omitted,
+        "primed": primed,
     }
     return new_body, meta
 

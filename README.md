@@ -179,6 +179,23 @@ concurrent sessions through one shared proxy the most recent launch wins (the
 proxy has no per-request signal to tell two live Claude Code sessions apart);
 requests handled before any project is set are tagged `unknown`.
 
+### Project Primer
+
+On the **first request of each session**, TokenSnap injects a compact,
+auto-generated overview of your project into the system prompt, so Claude
+understands the codebase immediately — no need to spend a turn exploring. The
+**Project Card** is built by scanning the current project folder and includes:
+its name, language and framework, key dependencies, top-level folder structure
+(ignoring `node_modules`, `.venv`, `.git`, …), current git branch and last
+commit, a summary of modified files, and a one-line README summary.
+
+It's generated once per session (cached, so the disk isn't re-scanned every
+request) and kept under ~500 tokens. The card for the most recent session is
+shown on the dashboard's **Project Primer** panel. Toggle it with
+`project_primer_enabled` (default `true`) in **Settings**, via
+`tokensnap config set project_primer_enabled false`, or leave it on — when
+off, behavior is unchanged.
+
 Both views show two sets of numbers:
 
 - **Est. saved** — Tokensnap's own tiktoken estimate of the request body
@@ -320,6 +337,7 @@ Stored in `~/.tokensnap/config.json`. Everything has a sensible default:
 | `openrouter_retry_delay_seconds` | `5` | Seconds to wait before trying the next fallback model. |
 | `context_store_enabled` | `false` | Opt-in [Differential Context Engine](#differential-context-engine--the-next-level-of-token-saving): mirror the conversation locally and send only a Context Tree + last exchanges + a `fetch_context` tool, instead of a Memory Card. See that section's trade-offs. |
 | `context_tree_size` | `20` | How many recent important events the Context Tree summarizes (only used when `context_store_enabled`). |
+| `project_primer_enabled` | `true` | Inject an auto-generated [Project Primer](#project-primer) (language, framework, structure, git state, README summary) into the system prompt on the first request of each session. |
 | `log_level` | `INFO` | Proxy log verbosity. |
 | `key` | *(empty)* | Optional stored Anthropic API key — normally unnecessary; the proxy forwards the key from request headers. |
 

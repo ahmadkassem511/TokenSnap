@@ -103,6 +103,52 @@ class TestContextEngineDashboard:
         assert "id='ctxenabled'" in html
         assert "Differential Context Engine" in html
 
+    def test_primer_route_registered(self):
+        app = webui.build_app()
+        paths = {r.resource.canonical for r in app.router.routes()}
+        assert "/api/primer" in paths
+
+    def test_api_primer_reports_enabled_and_last_card(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            webui.project_primer, "LAST_CARD_FILE", tmp_path / "card.json"
+        )
+        # No card generated yet.
+        data = json.loads(asyncio.run(webui.api_primer(None)).text)
+        assert data["enabled"] is True
+        assert data["card"] is None
+        # After a card is saved, the endpoint surfaces it.
+        webui.project_primer.save_last_card({"project_name": "demo", "language": "Python"})
+        data = json.loads(asyncio.run(webui.api_primer(None)).text)
+        assert data["card"]["project_name"] == "demo"
+
+    def test_api_primer_reflects_disabled_config(self):
+        from tokensnap import config as config_mod
+
+        config_mod.set_value("project_primer_enabled", "false")
+        data = json.loads(asyncio.run(webui.api_primer(None)).text)
+        assert data["enabled"] is False
+
+    def test_public_config_and_settings_include_primer(self):
+        from tokensnap import config as config_mod
+
+        assert webui._public_config()["project_primer_enabled"] is True
+
+        class FakeRequest:
+            async def json(self_inner):
+                return {"project_primer_enabled": "false"}
+
+        asyncio.run(webui._apply_settings(FakeRequest()))
+        assert config_mod.load()["project_primer_enabled"] is False
+
+    def test_dashboard_and_settings_have_primer_ui(self):
+        dash = webui._dashboard_page()
+        assert "Project Primer" in dash
+        assert "id='primercard'" in dash
+        assert "/api/primer" in dash
+        settings = webui._settings_page()
+        assert "id='primerenabled'" in settings
+        assert "Project Primer" in settings
+
     def _stats_json(self):
         return json.loads(asyncio.run(webui.api_stats(None)).text)
 

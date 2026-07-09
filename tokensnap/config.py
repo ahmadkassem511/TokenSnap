@@ -82,6 +82,14 @@ DEFAULTS: Dict[str, Any] = {
     "context_store_enabled": False,
     # How many recent important events the Context Tree summarizes.
     "context_tree_size": 20,
+    # --- Project Primer ----------------------------------------------------
+    # When True, the proxy injects a compact, auto-generated project overview
+    # (languages, framework, folder structure, git branch/last commit, README
+    # summary) into the system prompt on the first request of each session, so
+    # Claude Code understands the codebase immediately. Generated once per
+    # session from the current project directory; costs a small amount of
+    # tokens on that first request only.
+    "project_primer_enabled": True,
     # Optional stored API key (normally unused: the proxy forwards the
     # key Claude Code already sends in request headers)
     "key": "",
@@ -98,6 +106,7 @@ _TYPES = {
     "selective_compression": _to_bool,
     "context_store_enabled": _to_bool,
     "context_tree_size": int,
+    "project_primer_enabled": _to_bool,
     "openrouter_fallback_models": _to_model_list,
     "openrouter_max_retries": int,
     "openrouter_retry_delay_seconds": float,
