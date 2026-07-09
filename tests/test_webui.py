@@ -646,8 +646,21 @@ class TestLaunchUsesProjectDir:
         # The proxy reads the current-project state file per request to tag
         # its rows; the launch must have written the selected folder there.
         assert webui.project.get_current_project() == webui.get_launch_dir()
-        # And the env var is still set as a fallback.
-        assert os.environ["TOKENSNAP_PROJECT"] == webui.get_launch_dir()
+        # The env var is set too, as a fallback for a freshly-started proxy -
+        # using just the short folder name (not the full path).
+        assert os.environ["TOKENSNAP_PROJECT"] == "tagged"
+
+    def test_launch_does_not_clobber_manually_set_env(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(webui.subprocess, "Popen", lambda *a, **k: None)
+        monkeypatch.setenv("TOKENSNAP_PROJECT", "user-chosen-value")
+        proj = tmp_path / "tagged"
+        proj.mkdir()
+        webui.set_launch_dir(str(proj))
+        webui._launch_claude_terminal()
+        # The state file (authoritative) still gets the real launch dir...
+        assert webui.project.get_current_project() == webui.get_launch_dir()
+        # ...but a manually-set env var is left alone, not overwritten.
+        assert os.environ["TOKENSNAP_PROJECT"] == "user-chosen-value"
 
 
 class TestMultiLevelStatsEndpoints:

@@ -57,16 +57,34 @@ def test_run_resolves_claude_and_launches(monkeypatch):
 
 
 def test_run_records_current_project(monkeypatch):
+    import os
+
     from tokensnap import project as project_mod
 
     monkeypatch.delenv("TOKENSNAP_PROJECT", raising=False)
     monkeypatch.setattr(cli, "resolve_claude_command", lambda command: list(command))
     monkeypatch.setattr(cli.subprocess, "call", lambda *a, **k: 0)
     runner.invoke(cli.app, ["run", "claude"])
-    # `run` tags this session's project as the cwd, so the proxy attributes
-    # its requests correctly (read per request from the state file).
-    import os
+    # `run` tags this session's project as the cwd (state file - authoritative,
+    # read per request by the proxy), so requests are attributed correctly.
     assert project_mod.get_current_project() == os.getcwd()
+    # The env var fallback uses just the short folder name.
+    assert os.environ["TOKENSNAP_PROJECT"] == os.path.basename(os.getcwd())
+
+
+def test_run_does_not_clobber_manually_set_env(monkeypatch):
+    import os
+
+    from tokensnap import project as project_mod
+
+    monkeypatch.setenv("TOKENSNAP_PROJECT", "user-chosen-value")
+    monkeypatch.setattr(cli, "resolve_claude_command", lambda command: list(command))
+    monkeypatch.setattr(cli.subprocess, "call", lambda *a, **k: 0)
+    runner.invoke(cli.app, ["run", "claude"])
+    # The state file still gets the real cwd...
+    assert project_mod.get_current_project() == os.getcwd()
+    # ...but a manually-set env var is left alone.
+    assert os.environ["TOKENSNAP_PROJECT"] == "user-chosen-value"
 
 
 def test_run_errors_when_claude_missing(monkeypatch):

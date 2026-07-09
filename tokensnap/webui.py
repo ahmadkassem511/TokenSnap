@@ -381,11 +381,14 @@ def _launch_claude_terminal() -> "tuple[bool, str]":
 
     # Tag this session's requests with the selected project folder so the
     # dashboard's per-project stats attribute them correctly. The proxy reads
-    # this per request from a state file, so it works even against a proxy
-    # that's already running. The env var is set too as a fallback for a proxy
-    # freshly started from this process's environment.
+    # this per request from a state file (authoritative - the full path, so
+    # same-named folders in different locations don't collide), so it works
+    # even against a proxy that's already running. TOKENSNAP_PROJECT is set too
+    # as a fallback for a proxy freshly started from this process's
+    # environment; use the short folder name there and don't clobber a value
+    # the user set manually.
     project.set_current_project(get_launch_dir())
-    os.environ["TOKENSNAP_PROJECT"] = get_launch_dir()
+    os.environ.setdefault("TOKENSNAP_PROJECT", _project_display_name(get_launch_dir()))
 
     if not stats.proxy_running(*_proxy_host_port()):
         ok, log_path = stats.start_proxy_detached()

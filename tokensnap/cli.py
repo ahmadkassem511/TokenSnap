@@ -90,13 +90,16 @@ def run(
 
     # Tag this session's requests with the current project (its working
     # directory) so the dashboard can break stats down per project. The proxy
-    # reads this per request from a state file, so tagging works even against
-    # an already-running proxy (no restart needed). The env var is set too as a
-    # fallback for a proxy freshly started from this environment.
+    # reads this per request from a state file (authoritative - the full path,
+    # so same-named folders in different locations don't collide), so tagging
+    # works even against an already-running proxy (no restart needed).
+    # TOKENSNAP_PROJECT is set too as a fallback for a proxy freshly started
+    # from this environment; use the short folder name there and don't clobber
+    # a value the user set manually.
     from tokensnap import project as project_mod
 
     project_mod.set_current_project(os.getcwd())
-    os.environ.setdefault("TOKENSNAP_PROJECT", os.getcwd())
+    os.environ.setdefault("TOKENSNAP_PROJECT", os.path.basename(os.getcwd()))
 
     # Resolve `claude` even when it's installed but not on PATH (a common npm
     # global-install situation, especially on Windows). Non-claude commands
