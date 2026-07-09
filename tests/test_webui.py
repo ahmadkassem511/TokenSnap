@@ -577,6 +577,20 @@ class TestProjectDirEndpoints:
         assert data["path"] is None
         assert data["error"] == "no display here"
 
+    def test_browse_folder_never_500s_when_picker_raises(self, monkeypatch):
+        # If the picker subprocess machinery blows up unexpectedly, the handler
+        # must still return JSON with an error (the client falls back to typing
+        # a path) rather than a 500 the browser shows as "Folder picker failed".
+        def boom():
+            raise RuntimeError("kaboom")
+
+        monkeypatch.setattr(webui, "_pick_folder_native", boom)
+        resp = asyncio.run(webui.browse_folder(None))
+        assert resp.status == 200
+        data = json.loads(resp.text)
+        assert data["path"] is None
+        assert "kaboom" in data["error"]
+
     def test_dashboard_page_has_project_dir_ui(self):
         html = webui._dashboard_page()
         assert "id='projdir'" in html

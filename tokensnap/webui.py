@@ -492,13 +492,19 @@ def _pick_folder_native(timeout: float = 300.0):
         )
     except subprocess.TimeoutExpired:
         return None, "The folder picker timed out."
-    except (OSError, subprocess.SubprocessError) as exc:
-        return None, "Couldn't open a folder picker (%s)." % exc
-    if proc.returncode != 0:
-        # tkinter missing, or no display (a headless server).
+    except Exception as exc:  # noqa: BLE001 - any failure -> a clear message, not a 500
         return None, (
-            "A native folder picker isn't available here - type or paste a "
-            "path instead."
+            "Couldn't open a folder picker (%s). Type or paste a path instead."
+            % exc
+        )
+    if proc.returncode != 0:
+        # tkinter missing, no display, or the dialog couldn't attach to a
+        # desktop (e.g. a headless / detached dashboard process).
+        detail = (proc.stderr or "").strip().splitlines()
+        hint = (" [%s]" % detail[-1]) if detail else ""
+        return None, (
+            "A native folder picker isn't available here%s - type or paste a "
+            "path into the box and click Set instead." % hint
         )
     path = (proc.stdout or "").strip()
     return (path or None), None
@@ -507,9 +513,20 @@ def _pick_folder_native(timeout: float = 300.0):
 async def browse_folder(request: web.Request) -> web.Response:
     """Open a native folder picker and remember the chosen directory for
     subsequent launches. Runs the blocking dialog off the event loop so the
-    dashboard stays responsive while it's open."""
-    loop = asyncio.get_running_loop()
-    path, error = await loop.run_in_executor(None, _pick_folder_native)
+    dashboard stays responsive while it's open.
+
+    Always returns JSON (never a 500), so the client shows a specific reason
+    rather than a generic "Folder picker failed" - the picker is optional
+    anyway, since a path can be typed into the box instead."""
+    try:
+        loop = asyncio.get_running_loop()
+        path, error = await loop.run_in_executor(None, _pick_folder_native)
+    except Exception as exc:  # noqa: BLE001 - degrade to a typed-path fallback
+        return web.json_response(
+            {"path": None,
+             "error": "Folder picker unavailable (%s). Type a path and click Set."
+                      % exc}
+        )
     if error:
         return web.json_response({"path": None, "error": error})
     if path:
@@ -1006,7 +1023,8 @@ document.getElementById('browsebtn').onclick=async function(){
       document.getElementById('launchbtn').disabled=false;
       setProjMsg('Claude Code will launch in: '+r.path,true);toast('Folder selected');}
     else{setProjMsg('Folder selection cancelled.',true);}
-  }catch(e){setProjMsg('Folder picker failed.',false);}
+  }catch(e){setProjMsg('Folder picker unavailable - type or paste a path into the box and click Set.',false);
+    document.getElementById('projdir').focus();}
   self.disabled=false;self.textContent=old;
 };
 document.getElementById('launchbtn').onclick=async function(){
