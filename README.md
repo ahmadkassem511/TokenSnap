@@ -24,6 +24,7 @@ the ever-growing conversation history that silently eats your usage limits.
 - [How selective compression works](#how-selective-compression-works)
 - [Smarter Memory Cards with OpenRouter](#smarter-memory-cards-with-openrouter)
 - [Differential Context Engine — The Next Level of Token Saving](#differential-context-engine--the-next-level-of-token-saving)
+- [Project Cortex — A Local Second Brain for Your Code](#project-cortex--a-local-second-brain-for-your-code)
 - [Architecture](#architecture)
 - [Estimated vs. real tokens](#estimated-vs-real-tokens)
 - [Safety & scope](#safety--scope)
@@ -283,6 +284,8 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:8889
 | `tokensnap dashboard` | Web UI at `http://127.0.0.1:9876`: setup wizard, savings charts, live log, and settings. Runs independently of the proxy. `--port`, `--host`, `--no-browser`. |
 | `tokensnap monitor` | Live TUI: estimated savings **and real Anthropic usage** (input/output/cache), per-request table, proxy status. |
 | `tokensnap status` | Is the proxy up? Shows estimated savings and real token usage so far. |
+| `tokensnap focus [goal]` | Set (or show) the current project's focus/goal in its [Project Cortex](#project-cortex--a-local-second-brain-for-your-code) DNA. |
+| `tokensnap dna [--refresh]` | Show the project's Cortex DNA (stack, focus, decisions, resolved issues); `--refresh` re-scans the static analysis. |
 | `tokensnap config show` | Print the effective configuration. |
 | `tokensnap config set <key> <value>` | Change a setting (see below). |
 | `tokensnap config get <key>` | Read one setting. |
@@ -338,6 +341,9 @@ Stored in `~/.tokensnap/config.json`. Everything has a sensible default:
 | `context_store_enabled` | `false` | Opt-in [Differential Context Engine](#differential-context-engine--the-next-level-of-token-saving): mirror the conversation locally and send only a Context Tree + last exchanges + a `fetch_context` tool, instead of a Memory Card. See that section's trade-offs. |
 | `context_tree_size` | `20` | How many recent important events the Context Tree summarizes (only used when `context_store_enabled`). |
 | `project_primer_enabled` | `true` | Inject an auto-generated [Project Primer](#project-primer) (language, framework, structure, git state, README summary) into the system prompt on the first request of each session. |
+| `project_cortex_enabled` | `true` | Enable [Project Cortex](#project-cortex--a-local-second-brain-for-your-code): a persistent per-project DNA (stack, focus, decisions, resolved issues) injected as immutable Core Memory each session. Supersedes the Project Primer when on. |
+| `session_bridge_auto_inject` | `true` | Inject the previous session's summary (the [Session Bridge](#session-bridge--seamless-continuity)) so a new session resumes where the last left off. |
+| `dna_update_interval` | `86400` | Minimum seconds between re-scanning the project's static analysis into the DNA (the living parts update every session regardless). |
 | `log_level` | `INFO` | Proxy log verbosity. |
 | `key` | *(empty)* | Optional stored Anthropic API key — normally unnecessary; the proxy forwards the key from request headers. |
 
@@ -568,6 +574,65 @@ tree in  ─▶  model asks fetch_context([3,5])  ─▶  proxy serves events 3 
   identical to Memory Card mode** — this feature adds nothing to the classic
   path.
 
+## Project Cortex — A Local Second Brain for Your Code
+
+Compression saves tokens by *forgetting* the old parts of a conversation.
+**Project Cortex** is the counterweight: a persistent, per-project knowledge
+base that makes sure the things that matter about your project are *never*
+forgotten — carried into every new session automatically, and protected from
+compression. It's on by default (`project_cortex_enabled`, default `true`).
+
+Everything lives in a `.tokensnap/` folder **inside the project** (git-ignored
+by default, since session summaries can be personal), so it's local, private,
+and travels with the code.
+
+### Project DNA — the knowledge base
+
+`.tokensnap/project_dna.json` holds two halves:
+
+- **Static analysis** — tech stack, framework, key dependencies, entry points,
+  folder map, and git branch/last commit. Scanned from the project and
+  refreshed at most once per `dna_update_interval` seconds (default: daily).
+- **Living memory** — the **current focus/goal**, plus **decisions** and
+  **resolved issues** distilled from your sessions (labelled `Decision:` lines
+  and error→fix arcs are captured, even when the fix comes a few messages after
+  the error).
+
+On the first request of every session, a compact rendering of the DNA is
+injected as an **immutable Core Memory block** in the system prompt. Because
+TokenSnap only ever compresses the *message list*, never the system prompt,
+this context is **never truncated away**. So a fresh session already knows the
+stack, the plan, and the recent decisions — no re-explaining.
+
+### Session Bridge — seamless continuity
+
+When a session ends (the proxy stops), TokenSnap distils it into a summary under
+`.tokensnap/sessions/`. The next session for that project automatically picks up
+the most recent summary as an optional **Session Bridge** block
+(`session_bridge_auto_inject`, default `true`), so you resume exactly where you
+left off — even across restarts. It works **across tools**, too: paste a
+conversation from Claude Desktop into a file and import it as a bridge.
+
+### Adaptive compression with context priority
+
+The compressor assigns every message a **value weight** — assistant reasoning >
+user > tool result; decisions, explicit `important`/`note` markers, and code
+snippets raise it; bulk log/error dumps lower it; older messages decay, but a
+message you mark important holds a high floor. When a Memory Card must drop
+detail, the **highest-weight decisions are kept first**, so crucial context is
+never crowded out by trivia. (Weighting only decides *what gets summarised* — it
+never reorders the messages actually sent, which would break tool-call pairing.)
+
+### Managing it
+
+- **Dashboard → Project Cortex panel:** view the DNA, set the current focus, and
+  trigger a DNA refresh.
+- **CLI:** `tokensnap focus "add OAuth login"` sets the goal; `tokensnap dna`
+  (or `tokensnap dna --refresh`) shows the DNA.
+- **Config:** `project_cortex_enabled`, `session_bridge_auto_inject`,
+  `dna_update_interval`. With Cortex **off**, TokenSnap falls back to the
+  one-shot [Project Primer](#project-primer) and behavior is otherwise unchanged.
+
 ## Architecture
 
 ```
@@ -580,6 +645,9 @@ Claude Code  --ANTHROPIC_BASE_URL-->  Tokensnap proxy (127.0.0.1:8889)  -->  api
                                             |-- context_store.py local conversation mirror (SQLite)
                                             |-- context_engine.py Context Tree builder (Differential Context)
                                             |-- fetch_context.py proxy-side fetch_context tool cycle
+                                            |-- project_primer.py one-shot project overview card
+                                            |-- project_dna.py    persistent per-project DNA (Cortex)
+                                            |-- session_bridge.py cross-session continuity (Cortex)
                                             '-- stats.py         savings + liveness for status/monitor
 ```
 
