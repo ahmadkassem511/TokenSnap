@@ -320,3 +320,59 @@ class TestBuildMemoryCard:
         assert card["task"] == ""
         assert card["files_modified"] == []
         assert card["messages_summarized"] == 0
+
+
+class TestMessageWeight:
+    def test_assistant_outweighs_tool_result(self):
+        assistant = {"role": "assistant", "content": "here is my reasoning"}
+        tool = {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "t", "content": "ok"}]}
+        assert compressor.message_weight(assistant) > compressor.message_weight(tool)
+
+    def test_user_between_assistant_and_tool(self):
+        a = compressor.message_weight({"role": "assistant", "content": "x"})
+        u = compressor.message_weight({"role": "user", "content": "x"})
+        t = compressor.message_weight(
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t", "content": "x"}]}
+        )
+        assert a > u > t
+
+    def test_decision_and_important_raise_weight(self):
+        plain = {"role": "user", "content": "just some text"}
+        decision = {"role": "user", "content": "we will use Postgres"}
+        important = {"role": "user", "content": "IMPORTANT: never delete prod"}
+        assert compressor.message_weight(decision) > compressor.message_weight(plain)
+        assert compressor.message_weight(important) > compressor.message_weight(plain)
+
+    def test_recency_increases_weight(self):
+        m = {"role": "user", "content": "same text"}
+        old = compressor.message_weight(m, index=0, total=10)
+        new = compressor.message_weight(m, index=9, total=10)
+        assert new > old
+
+    def test_marked_important_holds_a_floor_despite_age(self):
+        note = {"role": "user", "content": "NOTE: keep this credential rotation logic"}
+        # Even as the oldest message, an explicit marker stays high.
+        assert compressor.message_weight(note, index=0, total=100) >= 4.0
+
+    def test_log_dump_lowers_weight(self):
+        dump = "\n".join("INFO line %d" % i for i in range(400)) + "\nerror: boom"
+        noisy = {"role": "user", "content": dump}
+        prose = {"role": "user", "content": "a short normal message"}
+        assert compressor.message_weight(noisy) < compressor.message_weight(prose)
+
+    def test_high_weight_decisions_survive_the_cap(self):
+        # More than _MAX_ITEMS decisions: low-weight (tool-result) ones should be
+        # dropped in favour of high-weight (assistant) ones.
+        msgs = []
+        for i in range(compressor._MAX_ITEMS):
+            msgs.append({"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t%d" % i,
+                 "content": "we will use lowprio-%d" % i}]})
+        for i in range(5):
+            msgs.append({"role": "assistant", "content": "Decision: we will use HIGHPRIO-%d" % i})
+        card = compressor.build_memory_card(msgs)
+        assert len(card["decisions"]) == compressor._MAX_ITEMS
+        highprio = [d for d in card["decisions"] if "HIGHPRIO" in d]
+        assert len(highprio) == 5  # all high-weight decisions kept

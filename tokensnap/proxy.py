@@ -17,13 +17,17 @@ from typing import Any, Dict, List, Optional, Tuple
 import aiohttp
 from aiohttp import web
 
+from collections import OrderedDict
+
 from tokensnap import (
     cleaner,
     compressor,
     context_engine,
     fetch_context,
     project,
+    project_dna,
     project_primer,
+    session_bridge,
     stats,
     token_counter,
 )
@@ -119,6 +123,117 @@ def _maybe_add_primer(
     return append_to_system(system, project_primer.format_card(card)), True
 
 
+# Project Cortex - sessions primed with Core Memory this process (so it's
+# injected once per session), and the latest full message list per session
+# (so it can be distilled into the DNA / a Session Bridge when the session
+# ends). Bounded so a long-lived proxy can't grow these without limit.
+_cortex_primed: set = set()
+_MAX_TRACKED_SESSIONS = 64
+_session_state: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
+
+
+def reset_cortex_state() -> None:
+    """Forget primed sessions and tracked message state (used by tests)."""
+    _cortex_primed.clear()
+    _session_state.clear()
+
+
+def _maybe_add_cortex(
+    system: Any, session_id: str, cfg: Dict[str, Any]
+) -> Tuple[Any, bool]:
+    """On the first request of a session, inject the immutable Core Memory
+    (Project DNA) and, if enabled, the previous session's Bridge.
+
+    Both go into the *system* prompt, which compression never touches, so this
+    context is never truncated away. Returns ``(system, added)``; a no-op when
+    Cortex is disabled, the project is unknown, or the session was already
+    primed this process. Never raises."""
+    if not bool(cfg.get("project_cortex_enabled", True)):
+        return system, False
+    if session_id in _cortex_primed:
+        return system, False
+    project_dir = project.get_current_project()
+    blocks = []
+    try:
+        dna = project_dna.ensure_dna(project_dir, cfg)
+        core = project_dna.format_core_memory(dna)
+        if core:
+            blocks.append(core)
+        if bool(cfg.get("session_bridge_auto_inject", True)):
+            prev = session_bridge.latest_session(
+                project_dir, exclude_session_id=session_id
+            )
+            if prev:
+                bridge = session_bridge.format_bridge(prev)
+                if bridge:
+                    blocks.append(bridge)
+    except Exception:  # noqa: BLE001 - Cortex must never break a request
+        return system, False
+    if not blocks:
+        return system, False
+    _cortex_primed.add(session_id)
+    for block in blocks:
+        system = append_to_system(system, block)
+    return system, True
+
+
+def _maybe_add_context_intro(
+    system: Any, session_id: str, cfg: Dict[str, Any]
+) -> Tuple[Any, bool]:
+    """Prepend a session's opening context. Project Cortex (Core Memory +
+    Session Bridge) supersedes the one-shot Project Primer when enabled, since
+    the DNA already contains the project overview; the primer stays as the
+    fallback when Cortex is off."""
+    if bool(cfg.get("project_cortex_enabled", True)):
+        return _maybe_add_cortex(system, session_id, cfg)
+    return _maybe_add_primer(system, session_id, cfg)
+
+
+def _remember_session(
+    session_id: str, messages: Any, cfg: Dict[str, Any]
+) -> None:
+    """Record the latest full conversation for a session so it can be distilled
+    into the DNA / a Session Bridge when the session ends (see
+    ``flush_all_sessions``). The API is stateless, so every request carries the
+    whole conversation - we just keep the most recent copy per session."""
+    if not bool(cfg.get("project_cortex_enabled", True)):
+        return
+    if not isinstance(messages, list) or not messages:
+        return
+    project_dir = project.get_current_project()
+    if not project_dir or project_dir == "unknown":
+        return
+    _session_state[session_id] = {
+        "project_dir": project_dir, "messages": messages, "cfg": cfg
+    }
+    _session_state.move_to_end(session_id)
+    while len(_session_state) > _MAX_TRACKED_SESSIONS:
+        _session_state.popitem(last=False)
+
+
+def flush_session(session_id: str) -> None:
+    """Distill one tracked session into its project's DNA and a Session Bridge,
+    then forget it. Best-effort; never raises."""
+    state = _session_state.pop(session_id, None)
+    if not state:
+        return
+    try:
+        session_bridge.save_session(
+            state["project_dir"], session_id, state["messages"]
+        )
+        project_dna.update_dna_from_session(
+            state["project_dir"], state["messages"], state["cfg"]
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def flush_all_sessions() -> None:
+    """Flush every tracked session (called on proxy shutdown)."""
+    for session_id in list(_session_state.keys()):
+        flush_session(session_id)
+
+
 def optimize_body(
     body: Dict[str, Any], cfg: Dict[str, Any]
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
@@ -135,6 +250,9 @@ def optimize_body(
     tokens_before = token_counter.count_message_tokens(messages, system)
     # Stable id for this conversation, used to prime it exactly once.
     primer_session = context_engine.derive_session_id(system, messages)
+    # Remember the full conversation so Project Cortex can distill it into the
+    # DNA / a Session Bridge when the session ends.
+    _remember_session(primer_session, messages, cfg)
 
     # Differential Context Engine: instead of a Memory Card, mirror the whole
     # conversation to the local Context Store and send only the last couple of
@@ -191,9 +309,9 @@ def optimize_body(
         system = _truncate_system(system)
         tokens_after = token_counter.count_message_tokens(messages, system)
 
-    # Project Primer: seed the first request of a session with a project
-    # overview. Added after compression so it's never truncated away.
-    system, primed = _maybe_add_primer(system, primer_session, cfg)
+    # Session opener: Project Cortex Core Memory (or the Project Primer when
+    # Cortex is off). Added after compression so it's never truncated away.
+    system, primed = _maybe_add_context_intro(system, primer_session, cfg)
     if primed:
         tokens_after = token_counter.count_message_tokens(messages, system)
 
@@ -245,9 +363,9 @@ def _optimize_differential(
         selective=bool(cfg.get("selective_compression", True)),
     )
 
-    # Project Primer: seed the first request of a session with a project
-    # overview, added to the (already rewritten) Context Tree system prompt.
-    new_system, primed = _maybe_add_primer(new_system, primer_session, cfg)
+    # Session opener: Project Cortex Core Memory (or the Project Primer when
+    # Cortex is off), added to the (already rewritten) Context Tree system prompt.
+    new_system, primed = _maybe_add_context_intro(new_system, primer_session, cfg)
 
     new_body = dict(body)
     new_body["messages"] = new_messages
@@ -303,6 +421,13 @@ class TokensnapProxy:
         stats.set_llm_status(status)
 
     async def _on_cleanup(self, app: web.Application) -> None:
+        # Project Cortex: distill each live session into its DNA + a Session
+        # Bridge so the next session resumes seamlessly. Off the event loop
+        # (it does disk I/O) and best-effort - shutdown must not hang or fail.
+        try:
+            await asyncio.to_thread(flush_all_sessions)
+        except Exception:  # noqa: BLE001
+            pass
         if self.session:
             await self.session.close()
 

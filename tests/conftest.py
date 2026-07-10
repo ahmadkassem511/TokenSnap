@@ -20,5 +20,10 @@ def _isolate_tokensnap_project_state(tmp_path_factory, monkeypatch):
     monkeypatch.setattr(project_primer, "LAST_CARD_FILE", base / "last_project_card.json")
     monkeypatch.delenv("TOKENSNAP_PROJECT", raising=False)
     project_primer.reset_cache()
+    # Project Cortex keeps per-session primed/tracked state on the proxy module;
+    # clear it so sessions don't leak between tests.
+    from tokensnap import proxy
+    proxy.reset_cortex_state()
     yield
     project_primer.reset_cache()
+    proxy.reset_cortex_state()

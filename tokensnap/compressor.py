@@ -48,10 +48,63 @@ _TASK_CHARS = 400
 
 MEMORY_CARD_HEADER = "[TOKENSNAP MEMORY CARD]"
 
+# Adaptive compression - value weighting. Phrases that mark a message as
+# high-value and worth preserving even as it ages ("important", explicit
+# keep markers, etc.). Kept separate from _DECISION_RE (which is about choices).
+_IMPORTANT_RE = re.compile(
+    r"(?i)(\b(important|note|remember|caveat|gotcha|warning|must|todo)\b"
+    r"|!important|@keep|@important)"
+)
+
 
 def _clip(line: str) -> str:
     line = line.strip()
     return line if len(line) <= _MAX_LINE else line[: _MAX_LINE - 1] + "…"
+
+
+def message_weight(
+    message: Dict[str, Any], index: int = 0, total: int = 1
+) -> float:
+    """A "how much is this worth keeping" score for adaptive compression.
+
+    Combines four signals the spec calls for:
+
+    * **Role** - assistant reasoning > user > tool result.
+    * **Content** - decisions, explicit "important" markers, and code snippets
+      raise the weight; log/terminal dumps lower it.
+    * **Recency** - newer messages weigh more (older ones decay), via ``index``
+      / ``total``.
+    * **Marked important** - a message with an explicit importance marker never
+      decays below a high floor, so crucial notes are never discarded.
+
+    Pure and side-effect free; callers use it to decide what survives when a
+    section must be capped. It never reorders the *sent* messages (that would
+    break the API's tool_use/tool_result pairing) - only what gets summarised.
+    """
+    text = message_text(message)
+    role = message.get("role")
+    if role == "assistant":
+        weight = 3.0
+    elif is_tool_result_only(message):
+        weight = 1.0
+    elif role == "user":
+        weight = 2.0
+    else:
+        weight = 1.5
+
+    important = bool(_IMPORTANT_RE.search(text))
+    if _DECISION_RE.search(text) or important:
+        weight += 2.0
+    if "```" in text:  # a code snippet is worth keeping
+        weight += 1.0
+    if _looks_like_terminal_dump(text):  # bulk log/trace noise is low value
+        weight -= 1.5
+
+    if total > 1:  # recency: 0 for the oldest, +1 for the newest
+        weight += index / (total - 1)
+    if important:  # explicit markers hold a high floor regardless of age
+        weight = max(weight, 4.0)
+    return max(0.1, weight)
 
 
 def build_memory_card(
@@ -69,12 +122,18 @@ def build_memory_card(
     files: List[str] = []
     decisions: List[str] = []
     errors_resolved: List[str] = []
+    # Value weight of the message each decision came from, so that when there
+    # are more decisions than fit, the highest-weight ones are kept (adaptive
+    # compression - crucial decisions are never crowded out by trivial ones).
+    decision_weight: Dict[str, float] = {}
     task = ""
+    total = len(messages)
 
-    for msg in messages:
+    for i, msg in enumerate(messages):
         text = message_text(msg)
         if not text:
             continue
+        weight = message_weight(msg, i, total)
         if not task and msg.get("role") == "user":
             task = _clip(text.split("\n", 1)[0])[:_TASK_CHARS]
 
@@ -91,6 +150,8 @@ def build_memory_card(
                 clipped = _clip(line)
                 if clipped and clipped not in decisions:
                     decisions.append(clipped)
+                if clipped:
+                    decision_weight[clipped] = max(decision_weight.get(clipped, 0), weight)
             if _ERROR_RE.search(line):
                 pending_error = _clip(line)
                 pending_age = 0
@@ -104,10 +165,23 @@ def build_memory_card(
                 elif pending_age > 5:
                     pending_error = None
 
+    # When decisions overflow the cap, keep the highest-weight ones (then
+    # restore chronological order among the survivors). Under the cap, order is
+    # unchanged - so this only ever changes *which* decisions are dropped.
+    if len(decisions) > _MAX_ITEMS:
+        keep = set(
+            sorted(decisions, key=lambda d: decision_weight.get(d, 0.0), reverse=True)[
+                :_MAX_ITEMS
+            ]
+        )
+        kept_decisions = [d for d in decisions if d in keep]
+    else:
+        kept_decisions = decisions[:_MAX_ITEMS]
+
     card = {
         "task": task,
         "files_modified": files[:_MAX_FILES],
-        "decisions": decisions[:_MAX_ITEMS],
+        "decisions": kept_decisions,
         "errors_resolved": errors_resolved[:_MAX_ITEMS],
         "messages_summarized": len(messages),
     }

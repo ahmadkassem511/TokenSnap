@@ -167,7 +167,9 @@ class TestDifferentialContextPath:
 class TestProjectPrimer:
     """The primer injects a project overview on the first request of a session.
     conftest keeps the project state isolated; here we point it at a temp
-    project so the primer has something real to scan."""
+    project so the primer has something real to scan. Project Cortex supersedes
+    the primer, so these tests disable it (`project_cortex_enabled=False`) to
+    exercise the primer path specifically."""
 
     @pytest.fixture(autouse=True)
     def temp_project(self, tmp_path, monkeypatch):
@@ -181,6 +183,11 @@ class TestProjectPrimer:
         project_primer.reset_cache()
         yield
 
+    @staticmethod
+    def _pcfg(**kw):
+        kw.setdefault("project_cortex_enabled", False)
+        return _cfg(**kw)
+
     def _has_primer(self, new_body):
         system = new_body.get("system") or ""
         return "PROJECT PRIMER" in (system if isinstance(system, str) else str(system))
@@ -188,25 +195,25 @@ class TestProjectPrimer:
     def test_injected_on_first_request_only(self):
         body = {"model": "claude-sonnet-5",
                 "system": "base", "messages": _long_history(1)}
-        nb1, m1 = optimize_body(dict(body), _cfg())
+        nb1, m1 = optimize_body(dict(body), self._pcfg())
         assert m1["primed"] is True
         assert self._has_primer(nb1)
         # Same conversation again -> already primed, not re-injected.
-        nb2, m2 = optimize_body(dict(body), _cfg())
+        nb2, m2 = optimize_body(dict(body), self._pcfg())
         assert m2["primed"] is False
         assert not self._has_primer(nb2)
 
     def test_disabled_toggle_skips_injection(self):
         body = {"model": "claude-sonnet-5",
                 "system": "base", "messages": _long_history(1)}
-        nb, m = optimize_body(body, _cfg(project_primer_enabled=False))
+        nb, m = optimize_body(body, self._pcfg(project_primer_enabled=False))
         assert m["primed"] is False
         assert not self._has_primer(nb)
 
     def test_injected_in_differential_path_too(self):
         body = {"model": "claude-sonnet-5",
                 "system": "base", "messages": _long_history(20)}
-        nb, m = optimize_body(body, _cfg(context_store_enabled=True))
+        nb, m = optimize_body(body, self._pcfg(context_store_enabled=True))
         assert m["primed"] is True
         assert self._has_primer(nb)
 
@@ -216,5 +223,86 @@ class TestProjectPrimer:
         project.set_current_project("")  # clears -> get_current_project == 'unknown'
         body = {"model": "claude-sonnet-5",
                 "system": "base", "messages": _long_history(1)}
-        _, m = optimize_body(body, _cfg())
+        _, m = optimize_body(body, self._pcfg())
+        assert m["primed"] is False
+
+
+class TestProjectCortex:
+    """Core Memory (Project DNA) + Session Bridge injection and session flush."""
+
+    @pytest.fixture(autouse=True)
+    def temp_project(self, tmp_path, monkeypatch):
+        from tokensnap import project, project_dna, proxy as proxy_mod
+
+        monkeypatch.setattr(context_store, "DB_FILE", tmp_path / "context_store.db")
+        proj = tmp_path / "proj"
+        proj.mkdir()
+        (proj / "pyproject.toml").write_text('dependencies = ["flask"]\n', encoding="utf-8")
+        (proj / "main.py").write_text("print(1)\n", encoding="utf-8")
+        project.set_current_project(str(proj))
+        project_dna.set_focus(str(proj), "Build the login flow")
+        proxy_mod.reset_cortex_state()
+        self.proj = str(proj)
+        yield
+
+    @staticmethod
+    def _sys(new_body):
+        s = new_body.get("system") or ""
+        return s if isinstance(s, str) else str(s)
+
+    def test_core_memory_injected_first_request_only(self):
+        body = {"model": "claude-sonnet-5", "system": "base",
+                "messages": _long_history(1)}
+        nb, m = optimize_body(dict(body), _cfg())
+        assert m["primed"] is True
+        s = self._sys(nb)
+        assert "CORE MEMORY" in s
+        assert "Build the login flow" in s   # the focus is present
+        assert "PROJECT PRIMER" not in s       # cortex supersedes the primer
+        # Not re-injected on the next request of the same session.
+        _, m2 = optimize_body(dict(body), _cfg())
+        assert m2["primed"] is False
+
+    def test_session_bridge_injected_when_prior_session_exists(self):
+        from tokensnap import session_bridge
+        session_bridge.save_session(self.proj, "old-sess", [
+            {"role": "user", "content": "set up db in db.py"},
+            {"role": "assistant", "content": "Decision: use SQLite"},
+            {"role": "user", "content": "error: locked db"},
+            {"role": "assistant", "content": "fixed with WAL, works now"},
+        ])
+        body = {"model": "claude-sonnet-5", "system": "base",
+                "messages": _long_history(1)}
+        nb, _ = optimize_body(dict(body), _cfg())
+        s = self._sys(nb)
+        assert "SESSION BRIDGE" in s
+        assert "SQLite" in s  # resumes the prior decision
+
+    def test_cortex_disabled_falls_back_to_primer(self):
+        body = {"model": "claude-sonnet-5", "system": "base",
+                "messages": _long_history(1)}
+        nb, m = optimize_body(dict(body), _cfg(project_cortex_enabled=False))
+        s = self._sys(nb)
+        assert "CORE MEMORY" not in s
+        assert "PROJECT PRIMER" in s  # primer is the fallback
+
+    def test_session_flush_updates_dna_and_saves_bridge(self):
+        from tokensnap import project_dna, session_bridge, proxy as proxy_mod
+
+        convo = _long_history(10)
+        convo.append({"role": "assistant", "content": "Decision: adopt pytest fixtures"})
+        body = {"model": "claude-sonnet-5", "system": "base", "messages": convo}
+        optimize_body(dict(body), _cfg())  # tracks the session
+        proxy_mod.flush_all_sessions()
+        dna = project_dna.load_dna(self.proj)
+        assert dna["changelog"]  # session distilled into the DNA
+        assert any("pytest fixtures" in d["text"] for d in dna["decisions"])
+        assert session_bridge.latest_session(self.proj) is not None  # bridge saved
+
+    def test_unknown_project_injects_nothing(self):
+        from tokensnap import project
+        project.set_current_project("")
+        body = {"model": "claude-sonnet-5", "system": "base",
+                "messages": _long_history(1)}
+        _, m = optimize_body(dict(body), _cfg())
         assert m["primed"] is False
