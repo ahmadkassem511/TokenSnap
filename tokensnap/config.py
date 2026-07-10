@@ -90,6 +90,24 @@ DEFAULTS: Dict[str, Any] = {
     # session from the current project directory; costs a small amount of
     # tokens on that first request only.
     "project_primer_enabled": True,
+    # --- Project Cortex ----------------------------------------------------
+    # The persistent "second brain" for a project. When True, the proxy loads a
+    # per-project knowledge base (<project>/.tokensnap/project_dna.json - tech
+    # stack, entry points, current focus, recent decisions, resolved issues)
+    # and injects it as an immutable "Core Memory" system block on the first
+    # request of each session, never touched by compression. It is refreshed
+    # incrementally as sessions run. Supersedes the Project Primer's one-shot
+    # card when enabled (the primer stays as the fallback overview generator).
+    "project_cortex_enabled": True,
+    # When True, a summary of the previous session for this project (the
+    # "Session Bridge") is injected alongside the DNA so a new session resumes
+    # seamlessly where the last one left off.
+    "session_bridge_auto_inject": True,
+    # Minimum seconds between re-scanning the project's static analysis (folder
+    # map / stack / deps) into the DNA. The living parts (focus, decisions,
+    # resolved issues) update every session regardless; only the expensive disk
+    # scan is throttled. Default: once per day.
+    "dna_update_interval": 86400,
     # Optional stored API key (normally unused: the proxy forwards the
     # key Claude Code already sends in request headers)
     "key": "",
@@ -107,6 +125,9 @@ _TYPES = {
     "context_store_enabled": _to_bool,
     "context_tree_size": int,
     "project_primer_enabled": _to_bool,
+    "project_cortex_enabled": _to_bool,
+    "session_bridge_auto_inject": _to_bool,
+    "dna_update_interval": int,
     "openrouter_fallback_models": _to_model_list,
     "openrouter_max_retries": int,
     "openrouter_retry_delay_seconds": float,
