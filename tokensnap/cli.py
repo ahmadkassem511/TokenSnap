@@ -354,6 +354,80 @@ def stop() -> None:
     )
 
 
+def _cortex_project_dir() -> Optional[str]:
+    """The project directory Cortex should act on: the last-tagged project if
+    it's valid, else the current working directory."""
+    from tokensnap import project as project_mod
+
+    tagged = project_mod.get_current_project()
+    if tagged and tagged != "unknown" and os.path.isdir(tagged):
+        return tagged
+    cwd = os.getcwd()
+    return cwd if os.path.isdir(cwd) else None
+
+
+@app.command()
+def focus(
+    goal: List[str] = typer.Argument(
+        None, help="The current task/goal to record (omit to show the current one)."
+    ),
+) -> None:
+    """Set (or show) the project's current focus in its Project Cortex DNA."""
+    from tokensnap import project_dna
+
+    project_dir = _cortex_project_dir()
+    if not project_dir:
+        console.print("[yellow]No project directory detected.[/yellow]")
+        raise typer.Exit(code=1)
+
+    if goal:
+        text = " ".join(goal).strip()
+        project_dna.set_focus(project_dir, text)
+        console.print("[green]Focus set for %s:[/green] %s" % (
+            os.path.basename(project_dir.rstrip("/\\")), text))
+    else:
+        dna = project_dna.load_dna(project_dir)
+        current = dna.get("focus") or "[dim](none set)[/dim]"
+        console.print("Current focus: %s" % current)
+
+
+@app.command()
+def dna(
+    refresh: bool = typer.Option(
+        False, "--refresh", help="Re-scan the project's static analysis now."
+    ),
+) -> None:
+    """Show the project's Cortex DNA (stack, focus, decisions, resolved issues)."""
+    from tokensnap import project_dna
+
+    project_dir = _cortex_project_dir()
+    if not project_dir:
+        console.print("[yellow]No project directory detected.[/yellow]")
+        raise typer.Exit(code=1)
+
+    if refresh:
+        cfg = dict(config_mod.load())
+        cfg["dna_update_interval"] = 0  # force a rescan
+        data = project_dna.ensure_dna(project_dir, cfg)
+        console.print("[green]DNA static analysis refreshed.[/green]")
+    else:
+        data = project_dna.ensure_dna(project_dir, config_mod.load())
+
+    static = data.get("static", {})
+    table = Table.grid(padding=(0, 2))
+    table.add_row("[bold]Project[/bold]", static.get("project_name", "-"))
+    table.add_row("Language", static.get("language", "-") or "-")
+    table.add_row("Framework", static.get("framework", "-") or "-")
+    table.add_row("Dependencies", ", ".join(static.get("key_dependencies", [])[:10]) or "-")
+    table.add_row("Entry points", ", ".join(static.get("entry_points", [])) or "-")
+    table.add_row("Focus", data.get("focus") or "[dim](none)[/dim]")
+    table.add_row("Decisions", str(len(data.get("decisions", []))))
+    table.add_row("Resolved issues", str(len(data.get("resolved_issues", []))))
+    console.print(Panel(table, title="Project Cortex DNA", border_style="cyan"))
+    for d in data.get("decisions", [])[-5:]:
+        console.print("  [cyan]•[/cyan] %s" % d.get("text", ""))
+
+
 @app.command()
 def cleanup(
     force: bool = typer.Option(

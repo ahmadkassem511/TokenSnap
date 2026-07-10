@@ -88,6 +88,8 @@ def _public_config() -> Dict[str, Any]:
         "context_store_enabled": bool(cfg.get("context_store_enabled", False)),
         "context_tree_size": int(cfg.get("context_tree_size", 20)),
         "project_primer_enabled": bool(cfg.get("project_primer_enabled", True)),
+        "project_cortex_enabled": bool(cfg.get("project_cortex_enabled", True)),
+        "session_bridge_auto_inject": bool(cfg.get("session_bridge_auto_inject", True)),
     }
 
 
@@ -254,6 +256,72 @@ async def api_primer(request: web.Request) -> web.Response:
     })
 
 
+def _cortex_project_dir() -> str:
+    """The project directory Cortex acts on for the dashboard - the currently
+    tagged project (falling back to the dashboard's launch dir)."""
+    tagged = project.get_current_project()
+    if tagged and tagged != "unknown" and os.path.isdir(tagged):
+        return tagged
+    launch = get_launch_dir()
+    return launch if os.path.isdir(launch) else ""
+
+
+async def api_cortex(request: web.Request) -> web.Response:
+    """Project Cortex status for the dashboard: whether it's on, the project's
+    DNA (stack, focus, decisions, resolved issues), and the session-bridge count."""
+    from tokensnap import project_dna, session_bridge
+
+    cfg = config_mod.load()
+    project_dir = _cortex_project_dir()
+    # Generate-on-view: ensure_dna scans once (throttled by dna_update_interval)
+    # then just reads, so opening the dashboard populates the project's DNA.
+    dna = project_dna.ensure_dna(project_dir, cfg) if project_dir else project_dna._empty_dna()
+    static = dna.get("static") or {}
+    return web.json_response({
+        "enabled": bool(cfg.get("project_cortex_enabled", True)),
+        "bridge_auto_inject": bool(cfg.get("session_bridge_auto_inject", True)),
+        "project_dir": project_dir,
+        "project_name": static.get("project_name", ""),
+        "language": static.get("language", ""),
+        "framework": static.get("framework", ""),
+        "key_dependencies": static.get("key_dependencies", []),
+        "entry_points": static.get("entry_points", []),
+        "focus": dna.get("focus", ""),
+        "decisions": [d.get("text", "") for d in dna.get("decisions", [])][-8:],
+        "resolved_issues": [r.get("text", "") for r in dna.get("resolved_issues", [])][-8:],
+        "session_count": len(session_bridge.list_sessions(project_dir)) if project_dir else 0,
+        "updated_at": dna.get("updated_at", 0),
+    })
+
+
+async def api_cortex_focus(request: web.Request) -> web.Response:
+    """Set the current project's focus/goal from the dashboard."""
+    from tokensnap import project_dna
+
+    project_dir = _cortex_project_dir()
+    if not project_dir:
+        return web.json_response({"ok": False, "error": "No project directory set."})
+    try:
+        body = await request.json()
+    except (ValueError, TypeError):
+        body = {}
+    project_dna.set_focus(project_dir, str(body.get("focus", "")))
+    return web.json_response({"ok": True, "focus": project_dna.load_dna(project_dir).get("focus", "")})
+
+
+async def api_cortex_refresh(request: web.Request) -> web.Response:
+    """Force a re-scan of the project's static DNA from the dashboard."""
+    from tokensnap import project_dna
+
+    project_dir = _cortex_project_dir()
+    if not project_dir:
+        return web.json_response({"ok": False, "error": "No project directory set."})
+    cfg = dict(config_mod.load())
+    cfg["dna_update_interval"] = 0  # force rescan
+    project_dna.ensure_dna(project_dir, cfg)
+    return web.json_response({"ok": True})
+
+
 async def api_openrouter_status(request: web.Request) -> web.Response:
     """OpenRouter model/fallback/rate-limit status, for the Settings page
     and the Dashboard's Memory Cards indicator."""
@@ -310,7 +378,8 @@ async def _apply_settings(request: web.Request) -> Dict[str, Any]:
     saved: Dict[str, Any] = {}
     for key in ("keep_messages", "selective_compression", "compressor_type",
                 "openrouter_model", "context_store_enabled", "context_tree_size",
-                "project_primer_enabled"):
+                "project_primer_enabled", "project_cortex_enabled",
+                "session_bridge_auto_inject"):
         if key not in body or body[key] in (None, ""):
             continue
         try:
@@ -573,6 +642,9 @@ def build_app() -> web.Application:
     app.router.add_get("/api/openrouter-status", api_openrouter_status)
     app.router.add_get("/api/context", api_context)
     app.router.add_get("/api/primer", api_primer)
+    app.router.add_get("/api/cortex", api_cortex)
+    app.router.add_post("/api/cortex/focus", api_cortex_focus)
+    app.router.add_post("/api/cortex/refresh", api_cortex_refresh)
     app.router.add_get("/setup", setup_page)
     app.router.add_post("/setup/save", setup_save)
     app.router.add_get("/settings", settings_page)
@@ -825,6 +897,22 @@ def _dashboard_page() -> str:
 
 <div class='panel'>
   <div style='display:flex;align-items:center;gap:14px;flex-wrap:wrap'>
+    <h2 style='margin:0'>Project Cortex</h2>
+    <span id='cortexpill' class='pill' style='margin-left:auto'><span class='dot'></span><span id='cortextext'>&hellip;</span></span>
+  </div>
+  <p class='sub muted' style='margin:6px 0 10px'>TokenSnap's persistent second brain for this project: a per-project knowledge
+    base (stack, focus, decisions, resolved issues) injected as immutable Core Memory at the start of every session, plus a
+    Session Bridge that carries context across restarts. Stored in <b>.tokensnap/</b> inside the project.</p>
+  <div style='display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-bottom:10px'>
+    <input type='text' id='cortexfocus' style='flex:1;min-width:260px' placeholder='Current focus / goal for this project'>
+    <button class='btn' id='cortexfocusbtn'>Set focus</button>
+    <button class='btn' id='cortexrefreshbtn'>Refresh DNA</button>
+  </div>
+  <pre class='log' id='cortexcard' style='height:auto;max-height:280px'>Loading&hellip;</pre>
+</div>
+
+<div class='panel'>
+  <div style='display:flex;align-items:center;gap:14px;flex-wrap:wrap'>
     <h2 style='margin:0'>Project Primer</h2>
     <span id='primerpill' class='pill' style='margin-left:auto'><span class='dot'></span><span id='primertext'>&hellip;</span></span>
   </div>
@@ -1058,10 +1146,46 @@ async function loadPrimer(){
     }
   }catch(e){}
 }
+var cortexFocusDirty=false;
+document.getElementById('cortexfocus').addEventListener('input',function(){cortexFocusDirty=true;});
+async function loadCortex(){
+  try{
+    var c=await (await fetch('/api/cortex')).json();
+    var pill=document.getElementById('cortexpill'), t=document.getElementById('cortextext');
+    pill.className='pill'+(c.enabled?' on':'');t.textContent=c.enabled?'enabled':'disabled';
+    if(!cortexFocusDirty)document.getElementById('cortexfocus').value=c.focus||'';
+    var lines=[];
+    if(c.project_name)lines.push('project: '+c.project_name);
+    if(c.language)lines.push('language: '+c.language+(c.framework?(' / '+c.framework):''));
+    if((c.key_dependencies||[]).length)lines.push('dependencies: '+c.key_dependencies.join(', '));
+    if((c.entry_points||[]).length)lines.push('entry_points: '+c.entry_points.join(', '));
+    lines.push('focus: '+(c.focus||'(none set)'));
+    if((c.decisions||[]).length)lines.push('\\ndecisions:\\n  - '+c.decisions.join('\\n  - '));
+    if((c.resolved_issues||[]).length)lines.push('\\nresolved issues:\\n  - '+c.resolved_issues.join('\\n  - '));
+    lines.push('\\nsaved sessions (bridges): '+(c.session_count||0));
+    document.getElementById('cortexcard').textContent=
+      c.project_dir?lines.join('\\n'):'No project selected yet \\u2014 set a project folder and launch Claude Code.';
+  }catch(e){}
+}
+document.getElementById('cortexfocusbtn').onclick=async function(){
+  var focus=document.getElementById('cortexfocus').value;
+  try{var r=await (await fetch('/api/cortex/focus',{method:'POST',
+    headers:{'Content-Type':'application/json'},body:JSON.stringify({focus:focus})})).json();
+    cortexFocusDirty=false;toast(r.ok?'Focus saved':(r.error||'Could not save focus'));loadCortex();}
+  catch(e){toast('Could not save focus');}
+};
+document.getElementById('cortexrefreshbtn').onclick=async function(){
+  var self=this;self.disabled=true;
+  try{var r=await (await fetch('/api/cortex/refresh',{method:'POST'})).json();
+    toast(r.ok?'DNA refreshed':(r.error||'Refresh failed'));loadCortex();}
+  catch(e){toast('Refresh failed');}
+  self.disabled=false;
+};
 loadProjectDir();
 loadAllTime();setInterval(loadAllTime,15000);
 loadProjects();setInterval(loadProjects,15000);
 loadPrimer();setInterval(loadPrimer,10000);
+loadCortex();setInterval(loadCortex,12000);
 setTimeout(loadChart,300);setInterval(loadChart,15000);
 loadLog();setInterval(loadLog,3000);
 loadORStatus();setInterval(loadORStatus,10000);
@@ -1238,6 +1362,24 @@ def _settings_page() -> str:
     </select>
   </div>
 
+  <div class='panel' style='margin-top:18px;padding:14px 18px'>
+    <div style='font-size:12.5px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;margin-bottom:8px'>
+      Project Cortex</div>
+    <p class='sub' style='margin-top:0'>A persistent per-project knowledge base (<b>.tokensnap/project_dna.json</b>): stack,
+      current focus, decisions, and resolved issues, injected as immutable Core Memory each session. Supersedes the Project
+      Primer when on. Manage the focus and DNA from the dashboard's Project Cortex panel.</p>
+    <label class='f'>Project Cortex</label>
+    <select id='cortexenabled'>
+      <option value='true'>on &mdash; persistent DNA + Core Memory (default)</option>
+      <option value='false'>off &mdash; fall back to the one-shot Project Primer</option>
+    </select>
+    <label class='f'>Session Bridge auto-inject</label>
+    <select id='bridgeinject'>
+      <option value='true'>on &mdash; resume from the previous session (default)</option>
+      <option value='false'>off &mdash; don't inject the previous session summary</option>
+    </select>
+  </div>
+
   <div style='display:flex;gap:12px;margin-top:24px;flex-wrap:wrap'>
     <button class='btn primary lg' id='save'>Save settings</button>
     <button class='btn lg' id='launchClaudeBtn'>&#128640; Launch Claude Code with current settings</button>
@@ -1265,6 +1407,8 @@ document.getElementById('keystatus').textContent=cfg.openrouter_api_key_set?'(a 
 document.getElementById('ctxenabled').value=cfg.context_store_enabled?'true':'false';
 document.getElementById('ctxtree').value=cfg.context_tree_size||20;
 document.getElementById('primerenabled').value=(cfg.project_primer_enabled===false)?'false':'true';
+document.getElementById('cortexenabled').value=(cfg.project_cortex_enabled===false)?'false':'true';
+document.getElementById('bridgeinject').value=(cfg.session_bridge_auto_inject===false)?'false':'true';
 async function loadCtxStatus(){
   var el=document.getElementById('ctxstats');
   try{
@@ -1312,7 +1456,9 @@ document.getElementById('save').onclick=async function(){
     openrouter_fallback_models:document.getElementById('fallback').value.trim(),
     context_store_enabled:document.getElementById('ctxenabled').value,
     context_tree_size:parseInt(document.getElementById('ctxtree').value,10)||20,
-    project_primer_enabled:document.getElementById('primerenabled').value};
+    project_primer_enabled:document.getElementById('primerenabled').value,
+    project_cortex_enabled:document.getElementById('cortexenabled').value,
+    session_bridge_auto_inject:document.getElementById('bridgeinject').value};
   var key=document.getElementById('apikey').value.trim();
   if(clearKeyRequested)payload.clear_key=true;
   else if(key)payload.openrouter_api_key=key;

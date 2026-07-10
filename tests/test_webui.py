@@ -149,6 +149,15 @@ class TestContextEngineDashboard:
         assert "id='primerenabled'" in settings
         assert "Project Primer" in settings
 
+    def test_dashboard_and_settings_have_cortex_ui(self):
+        dash = webui._dashboard_page()
+        assert "Project Cortex" in dash
+        assert "id='cortexfocus'" in dash
+        assert "/api/cortex" in dash
+        settings = webui._settings_page()
+        assert "id='cortexenabled'" in settings
+        assert "id='bridgeinject'" in settings
+
     def _stats_json(self):
         return json.loads(asyncio.run(webui.api_stats(None)).text)
 
@@ -766,3 +775,69 @@ class TestMultiLevelStatsEndpoints:
         assert "/api/stats/alltime" in html
         assert "/api/stats/projects" in html
         assert "tsnap_project_filter" in html
+
+
+class TestCortexEndpoints:
+    @pytest.fixture(autouse=True)
+    def isolated(self, tmp_path, monkeypatch):
+        from tokensnap import config as config_mod, project
+
+        monkeypatch.setattr(webui.config_mod, "CONFIG_DIR", tmp_path)
+        monkeypatch.setattr(webui.config_mod, "CONFIG_FILE", tmp_path / "config.json")
+        monkeypatch.setattr(project, "PROJECT_FILE", tmp_path / "current_project")
+        # A real project the DNA can scan, and point Cortex at it.
+        proj = tmp_path / "proj"
+        proj.mkdir()
+        (proj / "pyproject.toml").write_text('dependencies = ["flask"]\n', encoding="utf-8")
+        project.set_current_project(str(proj))
+        self.proj = str(proj)
+        yield
+
+    def _json(self, coro):
+        return json.loads(asyncio.run(coro).text)
+
+    def test_routes_registered(self):
+        app = webui.build_app()
+        paths = {r.resource.canonical for r in app.router.routes()}
+        assert "/api/cortex" in paths
+        assert "/api/cortex/focus" in paths
+        assert "/api/cortex/refresh" in paths
+
+    def test_cortex_reports_dna(self):
+        data = self._json(webui.api_cortex(None))
+        assert data["enabled"] is True
+        assert data["language"] == "Python"
+        assert data["framework"] == "Flask"
+        assert data["project_dir"] == self.proj
+
+    def test_set_focus_via_endpoint(self):
+        class Req:
+            async def json(self_inner):
+                return {"focus": "finish the exporter"}
+
+        res = self._json(webui.api_cortex_focus(Req()))
+        assert res["ok"] is True
+        assert res["focus"] == "finish the exporter"
+        # And it's reflected on the status endpoint.
+        assert self._json(webui.api_cortex(None))["focus"] == "finish the exporter"
+
+    def test_refresh_rescans(self):
+        res = self._json(webui.api_cortex_refresh(None))
+        assert res["ok"] is True
+        from tokensnap import project_dna
+        assert project_dna.load_dna(self.proj)["static"]["language"] == "Python"
+
+    def test_public_config_includes_cortex_keys(self):
+        pc = webui._public_config()
+        assert pc["project_cortex_enabled"] is True
+        assert pc["session_bridge_auto_inject"] is True
+
+    def test_apply_settings_persists_cortex_toggle(self):
+        from tokensnap import config as config_mod
+
+        class Req:
+            async def json(self_inner):
+                return {"project_cortex_enabled": "false"}
+
+        asyncio.run(webui._apply_settings(Req()))
+        assert config_mod.load()["project_cortex_enabled"] is False
