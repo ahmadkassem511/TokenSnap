@@ -258,6 +258,132 @@ class TestSelectiveCompression:
         assert out == msg
 
 
+def _read_tool_convo(tool_name, tool_input, file_content, second_call_name="Bash",
+                      second_input=None, second_content=None):
+    """A [tool_use, tool_result, tool_use, tool_result] conversation: the
+    first call is the one under test, the second is a plain Bash call whose
+    result should always still be compressed normally."""
+    second_input = second_input or {"command": "npm install"}
+    second_content = second_content or (
+        "\n".join("npm log line %d" % i for i in range(300))
+        + "\nnpm WARN deprecated foo\nadded 200 packages in 5s"
+    )
+    return [
+        {"role": "user", "content": "please do the thing"},
+        {"role": "assistant", "content": [
+            {"type": "tool_use", "id": "t1", "name": tool_name, "input": tool_input}]},
+        {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "t1", "content": file_content}]},
+        {"role": "assistant", "content": [
+            {"type": "tool_use", "id": "t2", "name": second_call_name, "input": second_input}]},
+        {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "t2", "content": second_content}]},
+    ]
+
+
+class TestReadToolNeverCompressed:
+    """A tool_result never carries its own tool name - only tool_use_id -
+    so identifying "was this a file read" requires resolving back to the
+    tool_use block that produced it (_build_tool_use_index)."""
+
+    def _compress_all(self, msgs):
+        idx = compressor._build_tool_use_index(msgs)
+        return [compressor._compress_message_selectively(m, idx) for m in msgs]
+
+    def test_read_tool_result_passed_through_verbatim(self):
+        big_file = "\n".join("line %d of the file" % i for i in range(500))
+        msgs = _read_tool_convo("Read", {"file_path": "config.py"}, big_file)
+        out = self._compress_all(msgs)
+        assert out[2]["content"][0]["content"] == big_file
+        assert "tokensnap" not in out[2]["content"][0]["content"]
+
+    def test_bash_tool_result_still_compressed_as_usual(self):
+        # The user's second explicit requirement: non-read tools (e.g. npm
+        # install output) must still be compressed exactly like before.
+        big_file = "irrelevant"
+        msgs = _read_tool_convo("Read", {"file_path": "x.py"}, big_file)
+        out = self._compress_all(msgs)
+        bash_result = out[4]["content"][0]["content"]
+        original_bash = msgs[4]["content"][0]["content"]
+        assert len(bash_result) < len(original_bash)
+        assert "tokensnap" in bash_result
+
+    def test_case_insensitive_tool_name_matching(self):
+        big_file = "\n".join("line %d" % i for i in range(500))
+        for name in ("read", "READ", "Read", "ReAd"):
+            msgs = _read_tool_convo(name, {"file_path": "x.py"}, big_file)
+            out = self._compress_all(msgs)
+            assert out[2]["content"][0]["content"] == big_file, name
+
+    def test_view_and_open_tool_names_also_exempt(self):
+        big_file = "\n".join("line %d" % i for i in range(500))
+        for name in ("View", "Open"):
+            msgs = _read_tool_convo(name, {"file_path": "x.py"}, big_file)
+            out = self._compress_all(msgs)
+            assert out[2]["content"][0]["content"] == big_file, name
+
+    def test_pure_shell_read_commands_are_exempt(self):
+        big_file = "\n".join("line %d of the file" % i for i in range(500))
+        for command in ("cat file.txt", "type file.txt", "Get-Content -Path file.txt",
+                         "head -n 100 file.txt", "tail file.txt", "more file.txt"):
+            msgs = _read_tool_convo("Bash", {"command": command}, big_file)
+            out = self._compress_all(msgs)
+            assert out[2]["content"][0]["content"] == big_file, command
+
+    def test_composed_shell_commands_are_not_exempt(self):
+        # "cat file.txt && rm file.txt" is not a pure read just because it
+        # starts with cat - a chained/piped/redirected command still
+        # compresses normally, since it does more than just read.
+        big_file = "\n".join("line %d of the file" % i for i in range(500))
+        for command in ("cat file.txt && rm file.txt", "cat file.txt | grep foo",
+                         "cat a.txt > b.txt", "cat a.txt; echo done"):
+            msgs = _read_tool_convo("Bash", {"command": command}, big_file)
+            out = self._compress_all(msgs)
+            assert out[2]["content"][0]["content"] != big_file, command
+            assert "tokensnap" in out[2]["content"][0]["content"], command
+
+    def test_ordinary_bash_command_not_exempt(self):
+        big_file = "\n".join("line %d of the file" % i for i in range(500))
+        msgs = _read_tool_convo("Bash", {"command": "npm install"}, big_file)
+        out = self._compress_all(msgs)
+        assert out[2]["content"][0]["content"] != big_file
+        assert "tokensnap" in out[2]["content"][0]["content"]
+
+    def test_unresolvable_tool_use_id_falls_back_to_normal_compression(self):
+        # A safe default: if the originating call can't be resolved (e.g. an
+        # empty index), a large result still compresses rather than silently
+        # skipping compression for everything.
+        big_file = "\n".join("line %d of the file" % i for i in range(500))
+        msg = {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "unknown", "content": big_file}]}
+        out = compressor._compress_message_selectively(msg, {})
+        assert out["content"][0]["content"] != big_file
+
+    def test_no_index_argument_falls_back_to_normal_compression(self):
+        # Backward compatible: existing callers that never pass an index
+        # still get ordinary compression, not a silent skip.
+        big_file = "\n".join("line %d of the file" % i for i in range(500))
+        msg = {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "t1", "content": big_file}]}
+        out = compressor._compress_message_selectively(msg)
+        assert out["content"][0]["content"] != big_file
+
+    def test_read_tool_result_as_content_blocks_also_exempt(self):
+        # Some tool_result contents are a list of {"type":"text",...} blocks
+        # rather than a bare string - the exemption must cover that shape too.
+        big_file = "\n".join("line %d of the file" % i for i in range(500))
+        msgs = [
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "t1", "name": "Read", "input": {"file_path": "x.py"}}]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1",
+                 "content": [{"type": "text", "text": big_file}]}]},
+        ]
+        idx = compressor._build_tool_use_index(msgs)
+        out = compressor._compress_message_selectively(msgs[1], idx)
+        assert out["content"][0]["content"][0]["text"] == big_file
+
+
 class TestBuildCompressedContext:
     def _agentic_history(self):
         msgs = [{"role": "user", "content": "Fix the failing tests in src/app.py"}]

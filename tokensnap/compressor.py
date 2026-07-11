@@ -335,7 +335,10 @@ def compress_messages(
 # unless they contain a large terminal/log dump, in which case only that
 # dump is reduced to its error/warning/status lines. Tool results are
 # compressed the same way, more aggressively, since they're almost always
-# machine-generated noise once the outcome is known.
+# machine-generated noise once the outcome is known - EXCEPT a file read
+# (Read/View/Open, or a pure unchained "cat"/"type"/"Get-Content"/... shell
+# command): that result *is* the substance Claude asked to see, so it is
+# never compressed, in any tier (see _is_read_only_tool_call).
 # ---------------------------------------------------------------------------
 
 # A user or tool_result text block bigger than this is a candidate for
@@ -443,15 +446,87 @@ def _compress_tool_result_text(text: str) -> str:
     return _extract_signal_lines(text)
 
 
-def _compress_message_selectively(message: Dict[str, Any]) -> Dict[str, Any]:
+# Dedicated read tools whose result *is* file content - compressing it would
+# blind Claude to what it just asked to see, defeating the point of reading.
+# Matched case-insensitively against the tool_use block's exact `name`.
+_READ_TOOL_NAMES = {"read", "view", "open"}
+# Shell verbs that only ever read a file, invoked through the Bash tool - "cat",
+# not "Bash", is what the user actually asked to run, so it needs its own,
+# narrower check (see _is_read_only_tool_call).
+_READ_SHELL_VERBS = ("cat", "type", "get-content", "head", "tail", "more", "less")
+# Any of these means the command *does something else too* (piping, chaining,
+# redirecting), so "cat file.txt && rm file.txt" is correctly NOT exempted
+# just because it starts with a read verb.
+_SHELL_COMPOSITION_RE = re.compile(r"[|&;><]")
+
+
+def _is_read_only_tool_call(
+    tool_name: Optional[str], tool_input: Optional[Dict[str, Any]]
+) -> bool:
+    """True when a tool_use call is a pure file read whose result must never
+    be summarized away: either a dedicated read tool (Read/View/Open), or a
+    Bash call whose *entire* command is a single read-only verb with no
+    piping/chaining/redirection.
+    """
+    name = str(tool_name or "").strip().lower()
+    if name in _READ_TOOL_NAMES:
+        return True
+    if name != "bash":
+        return False
+    command = ""
+    if isinstance(tool_input, dict):
+        command = str(tool_input.get("command") or tool_input.get("script") or "")
+    command = command.strip()
+    if not command or _SHELL_COMPOSITION_RE.search(command):
+        return False
+    words = command.split()
+    return bool(words) and words[0].lower() in _READ_SHELL_VERBS
+
+
+def _build_tool_use_index(messages: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    """Map every tool_use block's id to its ``{"name", "input"}``.
+
+    A tool_result block only carries a ``tool_use_id`` - never the tool name
+    - so identifying "was this a file read" requires looking back at the
+    tool_use block that produced it. Scans the whole conversation once, up
+    front, so callers can look up any tool_result regardless of where its
+    originating tool_use falls (they're always adjacent turns in practice).
+    """
+    index: Dict[str, Dict[str, Any]] = {}
+    for m in messages:
+        if m.get("role") != "assistant":
+            continue
+        content = m.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "tool_use":
+                tool_use_id = block.get("id")
+                if tool_use_id:
+                    index[tool_use_id] = {
+                        "name": block.get("name"),
+                        "input": block.get("input"),
+                    }
+    return index
+
+
+def _compress_message_selectively(
+    message: Dict[str, Any],
+    tool_use_index: Optional[Dict[str, Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
     """Apply the selective-compression philosophy to one message:
     assistant messages pass through untouched; user text is scanned for
-    terminal dumps; tool_result content is compressed aggressively."""
+    terminal dumps; tool_result content is compressed aggressively - except
+    a file read (see ``_is_read_only_tool_call``), which is never touched.
+    ``tool_use_index`` (from ``_build_tool_use_index``) resolves a
+    tool_result's originating call; omitting it (or an unresolvable id)
+    safely falls back to normal compression."""
     role = message.get("role")
     if role == "assistant":
         return message
 
     content = message.get("content")
+    tool_use_index = tool_use_index or {}
 
     if isinstance(content, str):
         # A plain string message: only "user" messages reach here with a
@@ -463,6 +538,10 @@ def _compress_message_selectively(message: Dict[str, Any]) -> Dict[str, Any]:
         new_blocks = []
         for block in content:
             if isinstance(block, dict) and block.get("type") == "tool_result":
+                call = tool_use_index.get(block.get("tool_use_id"), {})
+                if _is_read_only_tool_call(call.get("name"), call.get("input")):
+                    new_blocks.append(block)  # a file read - passed through verbatim
+                    continue
                 block = dict(
                     block,
                     content=_transform_tool_result_content(block.get("content")),
@@ -502,7 +581,8 @@ def build_compressed_context(
     Returns (memory_card_text_or_None, processed_messages).
     """
     cfg = cfg or {}
-    messages = [_compress_message_selectively(m) for m in messages]
+    tool_use_index = _build_tool_use_index(messages)
+    messages = [_compress_message_selectively(m, tool_use_index) for m in messages]
     return compress_messages(
         messages,
         keep_last_n=keep_messages,

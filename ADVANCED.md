@@ -283,6 +283,14 @@ based on its role:
   they're almost always machine-generated noise once the outcome is known.
   A 200-line build log becomes a couple of error lines plus something like
   `[tokensnap: 180 lines omitted (2 errors, 1 warning)]`.
+- **File reads are the one exception.** A `Read`/`View`/`Open` tool result -
+  or a `Bash` call whose entire command is a single unchained read (`cat`,
+  `type`, `Get-Content`, `head`, `tail`, `more`, `less` — no `|`, `&&`, `;`,
+  `>`/`<`) - is passed through completely untouched, in every tier. That
+  result *is* the file content Claude asked to see; summarizing it would
+  defeat the point of reading in the first place. A command that does more
+  than read (`cat file.txt && rm file.txt`) is correctly not exempted just
+  because it starts with a read verb.
 
 Set `selective_compression = false` (or use `tokensnap preset complex`) to
 go back to the legacy behavior: no per-message cleaning, just uniform

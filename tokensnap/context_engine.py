@@ -214,7 +214,12 @@ def reconstruct(
     # the omitted head; rewrite them to plain text so the history stays valid.
     tail = [compressor._orphaned_results_to_text(tail[0])] + tail[1:]
     if selective:
-        tail = [compressor._compress_message_selectively(m) for m in tail]
+        # Built from the full (uncut) messages so a tail tool_result's
+        # originating tool_use resolves correctly even if it - unusually -
+        # isn't itself in the tail (see compressor._is_read_only_tool_call:
+        # file reads are passed through untouched, in this tier too).
+        tool_use_index = compressor._build_tool_use_index(messages)
+        tail = [compressor._compress_message_selectively(m, tool_use_index) for m in tail]
 
     tree = context_store.get_recent_tree(session_id, tree_size)
     # Guarantee the original task is never entirely lost. get_recent_tree only

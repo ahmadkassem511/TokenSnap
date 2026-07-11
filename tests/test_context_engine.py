@@ -350,3 +350,27 @@ class TestReconstruct:
         # A converted orphan is a plain string, never a bare tool_result block.
         if isinstance(first["content"], list):
             assert not all(b.get("type") == "tool_result" for b in first["content"])
+
+    def test_read_tool_result_in_kept_tail_is_never_compressed(self):
+        # reconstruct() builds its own tool_use_index from the full (uncut)
+        # messages before selectively compressing the tail - a Read result
+        # landing in that tail must survive byte-identical.
+        system, msgs = _history(10)  # 20 messages
+        big_file = "\n".join("line %d of config.py" % i for i in range(500))
+        msgs = list(msgs) + [
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "r1", "name": "Read", "input": {"file_path": "config.py"}}]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "r1", "content": big_file}]},
+        ]
+        sid = ce.derive_session_id(system, msgs)
+        ce.ingest(sid, msgs)
+        new_msgs, _, reconstructed, _ = ce.reconstruct(
+            msgs, system, sid, min_messages=8, selective=True, keep_exchanges=2
+        )
+        assert reconstructed is True
+        tool_results = [
+            b for m in new_msgs if isinstance(m.get("content"), list)
+            for b in m["content"] if isinstance(b, dict) and b.get("type") == "tool_result"
+        ]
+        assert any(b["content"] == big_file for b in tool_results)

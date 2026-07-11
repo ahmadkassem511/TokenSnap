@@ -97,6 +97,39 @@ class TestSelectiveCompressionPlumbing:
         assert meta["compressed"] is False
         assert len(new_body["messages"]) == len(body["messages"])
 
+    def test_read_tool_result_never_compressed_but_bash_still_is(self):
+        # LIGHT tier: a Read tool result must survive completely untouched,
+        # while an ordinary Bash result (npm install) is still compressed -
+        # both requirements from the same conversation, so a regression in
+        # either direction would be caught. Selective compression runs over
+        # every message (this pair doesn't need to fall into the truncated
+        # "head" - even kept/verbatim-region messages get noise-cleaned).
+        big_file = "\n".join("line %d of config.py" % i for i in range(500))
+        npm_output = ("\n".join("npm log line %d" % i for i in range(300))
+                      + "\nnpm WARN deprecated foo\nadded 200 packages in 5s")
+        msgs = [
+            {"role": "user", "content": "read config.py and then run npm install"},
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "r1", "name": "Read", "input": {"file_path": "config.py"}}]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "r1", "content": big_file}]},
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "b1", "name": "Bash", "input": {"command": "npm install"}}]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "b1", "content": npm_output}]},
+        ]
+        body = {"model": "claude-sonnet-5", "messages": msgs}
+        new_body, _ = optimize_body(body, _cfg())
+        by_id = {
+            b["tool_use_id"]: b["content"]
+            for m in new_body["messages"]
+            if isinstance(m.get("content"), list)
+            for b in m["content"]
+            if isinstance(b, dict) and b.get("type") == "tool_result"
+        }
+        assert by_id["r1"] == big_file  # Read result: byte-identical, no [tokensnap] tag
+        assert "tokensnap" in by_id["b1"] and len(by_id["b1"]) < len(npm_output)
+
 
 class TestAggressiveThreshold:
     def test_not_aggressive_when_under_threshold(self):
@@ -202,6 +235,36 @@ class TestDifferentialContextPath:
         assert meta["compressed"] is True
         text = str(new_body.get("system"))
         assert "run video_pipeline.py for me" in text
+
+    def test_read_tool_result_never_compressed_but_bash_still_is(self):
+        # FULL tier: the same guarantee as LIGHT tier, but here the pair must
+        # land in the kept *tail* (the verbatim region ahead of the Context
+        # Tree) - reconstruct() applies selective compression to the tail too.
+        big_file = "\n".join("line %d of config.py" % i for i in range(500))
+        npm_output = ("\n".join("npm log line %d" % i for i in range(300))
+                      + "\nnpm WARN deprecated foo\nadded 200 packages in 5s")
+        msgs = _long_history(20) + [
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "r1", "name": "Read", "input": {"file_path": "config.py"}}]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "r1", "content": big_file}]},
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "b1", "name": "Bash", "input": {"command": "npm install"}}]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "b1", "content": npm_output}]},
+        ]
+        body = {"model": "claude-sonnet-5", "messages": msgs}
+        new_body, meta = optimize_body(body, _cfg(context_store_enabled=True))
+        assert meta["context_store"] is True
+        by_id = {
+            b["tool_use_id"]: b["content"]
+            for m in new_body["messages"]
+            if isinstance(m.get("content"), list)
+            for b in m["content"]
+            if isinstance(b, dict) and b.get("type") == "tool_result"
+        }
+        assert by_id["r1"] == big_file  # Read result: byte-identical, no [tokensnap] tag
+        assert "tokensnap" in by_id["b1"] and len(by_id["b1"]) < len(npm_output)
 
     def test_existing_tools_are_preserved(self):
         body = {
