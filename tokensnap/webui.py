@@ -79,6 +79,7 @@ def _public_config() -> Dict[str, Any]:
     set - so it can't leak into page source or browser history."""
     cfg = config_mod.load()
     return {
+        "compression_level": cfg.get("compression_level", "adaptive"),
         "keep_messages": int(cfg["keep_messages"]),
         "selective_compression": bool(cfg["selective_compression"]),
         "compressor_type": cfg["compressor_type"],
@@ -376,10 +377,10 @@ async def _apply_settings(request: web.Request) -> Dict[str, Any]:
             body.setdefault(key, value)
 
     saved: Dict[str, Any] = {}
-    for key in ("keep_messages", "selective_compression", "compressor_type",
-                "openrouter_model", "context_store_enabled", "context_tree_size",
-                "project_primer_enabled", "project_cortex_enabled",
-                "session_bridge_auto_inject"):
+    for key in ("compression_level", "keep_messages", "selective_compression",
+                "compressor_type", "openrouter_model", "context_store_enabled",
+                "context_tree_size", "project_primer_enabled",
+                "project_cortex_enabled", "session_bridge_auto_inject"):
         if key not in body or body[key] in (None, ""):
             continue
         try:
@@ -762,6 +763,17 @@ input:focus,select:focus{outline:none;border-color:var(--accent2)}
   opacity:0;pointer-events:none;transition:.25s}
 .toast.show{opacity:1;transform:translateX(-50%) translateY(-4px)}
 .muted{color:var(--muted)}
+.hero .heronum{font-size:58px;font-weight:800;letter-spacing:-1.5px;color:var(--accent);line-height:1.05;margin-top:8px}
+.hero .herosub{font-size:14.5px;color:var(--muted);margin-top:6px}
+.hero .herorow{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-top:22px}
+.hero .herorow input,.hero .herorow select{width:auto}
+details.panel{padding:0}
+details.panel>summary{cursor:pointer;font-weight:700;font-size:15px;list-style:none;padding:22px;user-select:none}
+details.panel>summary::-webkit-details-marker{display:none}
+details.panel>summary:before{content:'\\25B8';color:var(--accent2);display:inline-block;width:14px}
+details.panel[open]>summary:before{content:'\\25BE'}
+details.panel>summary .sub{font-weight:400}
+details.panel>.advbody{padding:0 22px 22px}
 """
 
 _NAV = (
@@ -820,119 +832,125 @@ refreshPill();setInterval(refreshPill,3000);
 
 def _dashboard_page() -> str:
     body = """
-<div class='grid cards'>
-  <div class='card level'><h3>This Session</h3><div class='big accent' id='s_saved'>-</div>
-    <div class='sub' id='s_sub'>tokens saved &middot; since the proxy last started</div></div>
-  <div class='card level'><h3>All Time</h3><div class='big' id='a_saved'>-</div>
-    <div class='sub' id='a_sub'>tokens saved across all sessions</div></div>
-  <div class='card level'><h3>Total Projects</h3><div class='big' id='p_count'>-</div>
-    <div class='sub' id='p_sub'>tracked in your history</div></div>
-</div>
-
-<div class='grid cards' style='margin-top:18px'>
-  <div class='card'><h3>Real usage (Anthropic)</h3><div class='big' id='c_real'>-</div>
-    <div class='sub'>in / out tokens (this session)</div></div>
-  <div class='card'><h3>Active model</h3><div class='big' id='c_model' style='font-size:19px'>-</div>
-    <div class='sub'>keep_messages = <span id='c_keep'>-</span></div></div>
-  <div class='card'><h3>Differential Context Engine</h3><div class='big' id='c_ctx' style='font-size:17px'>-</div>
-    <div class='sub' id='c_ctx_sub'>-</div></div>
-</div>
-
-<div class='panel'>
-  <div style='display:flex;align-items:center;gap:14px;flex-wrap:wrap'>
-    <h2 style='margin:0'>Project stats</h2>
-    <span class='sub muted' style='margin-left:auto' id='projhint'></span>
-  </div>
-  <div class='projscroll' id='projects'></div>
-  <div id='projempty' class='empty' style='display:none'>
-    No projects tracked yet. Launch Claude Code from this dashboard or via
-    <b>tokensnap run claude</b> to start tracking.</div>
-</div>
-
-<div class='panel'>
-  <div style='display:flex;align-items:center;gap:14px;flex-wrap:wrap'>
-    <h2 style='margin:0'>Tokens saved over time</h2>
-    <select id='projfilter' class='projfilter' style='margin-left:auto'>
-      <option value=''>All projects</option>
-    </select>
-    <div class='chartbtns' style='margin:0'>
-      <button data-p='day' class='active'>7 days</button>
-      <button data-p='week'>8 weeks</button>
-      <button data-p='month'>6 months</button>
-    </div>
-  </div>
-  <div style='position:relative;height:300px;margin-top:12px'>
-    <canvas id='chart'></canvas>
-    <div id='chartempty' class='empty' style='display:none;position:absolute;inset:0'>
-      No history yet. Once you run <b>tokensnap run claude</b> through the proxy,
-      your savings will appear here.</div>
-  </div>
-</div>
-
-<div class='row'>
-  <div class='panel'>
-    <h2>Recent requests</h2>
-    <div style='max-height:320px;overflow:auto'>
-      <table><thead><tr><th>time</th><th>model</th><th class='r'>est.in</th>
-      <th class='r'>saved</th><th class='r'>real.in</th><th class='r'>real.out</th><th class='r'>http</th></tr></thead>
-      <tbody id='recent'><tr><td colspan='7' class='empty'>no requests yet</td></tr></tbody></table>
-    </div>
-  </div>
-</div>
-
-<div class='panel'>
-  <div style='display:flex;align-items:center;gap:14px;flex-wrap:wrap'>
-    <h2 style='margin:0'>Project directory</h2>
-    <button class='btn primary' id='launchbtn' style='margin-left:auto'>Launch Claude Code</button>
-  </div>
-  <p class='sub muted' style='margin:6px 0 12px'>Claude Code opens in this folder when you launch it from here.
-    (Running <b>tokensnap run claude</b> in a terminal still uses that terminal's own folder.)</p>
-  <div style='display:flex;gap:10px;flex-wrap:wrap;align-items:center'>
-    <input type='text' id='projdir' style='flex:1;min-width:260px' placeholder='/path/to/your/project'>
+<div class='panel hero'>
+  <div class='sub muted'>Token savings this session</div>
+  <div class='heronum' id='hero_saved'>-</div>
+  <div class='herosub' id='hero_sub'>Launch Claude Code below to start saving tokens.</div>
+  <div class='herorow'>
+    <select id='projdirselect' style='min-width:220px'><option value=''>Choose a project you've used before&hellip;</option></select>
+    <input type='text' id='projdir' style='flex:1;min-width:220px' placeholder='or type/paste a project folder path'>
     <button class='btn' id='browsebtn'>Browse&hellip;</button>
     <button class='btn' id='setdirbtn'>Set</button>
   </div>
   <div class='sub muted' id='projdirmsg' style='margin-top:8px'>Loading&hellip;</div>
+  <button class='btn primary lg' id='launchbtn' style='margin-top:16px'>Launch Claude Code</button>
 </div>
 
-<div class='panel'>
-  <div style='display:flex;align-items:center;gap:14px;flex-wrap:wrap'>
-    <h2 style='margin:0'>Project Cortex</h2>
-    <span id='cortexpill' class='pill' style='margin-left:auto'><span class='dot'></span><span id='cortextext'>&hellip;</span></span>
-  </div>
-  <p class='sub muted' style='margin:6px 0 10px'>TokenSnap's persistent second brain for this project: a per-project knowledge
-    base (stack, focus, decisions, resolved issues) injected as immutable Core Memory at the start of every session, plus a
-    Session Bridge that carries context across restarts. Stored in <b>.tokensnap/</b> inside the project.</p>
-  <div style='display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-bottom:10px'>
-    <input type='text' id='cortexfocus' style='flex:1;min-width:260px' placeholder='Current focus / goal for this project'>
-    <button class='btn' id='cortexfocusbtn'>Set focus</button>
-    <button class='btn' id='cortexrefreshbtn'>Refresh DNA</button>
-  </div>
-  <pre class='log' id='cortexcard' style='height:auto;max-height:280px'>Loading&hellip;</pre>
-</div>
+<details class='panel' id='advanced'>
+  <summary>Advanced <span class='sub muted'>&mdash; stats, history &amp; internals</span></summary>
+  <div class='advbody'>
 
-<div class='panel'>
-  <div style='display:flex;align-items:center;gap:14px;flex-wrap:wrap'>
-    <h2 style='margin:0'>Project Primer</h2>
-    <span id='primerpill' class='pill' style='margin-left:auto'><span class='dot'></span><span id='primertext'>&hellip;</span></span>
+  <div class='grid cards'>
+    <div class='card level'><h3>This Session</h3><div class='big accent' id='s_saved'>-</div>
+      <div class='sub' id='s_sub'>tokens saved &middot; since the proxy last started</div></div>
+    <div class='card level'><h3>All Time</h3><div class='big' id='a_saved'>-</div>
+      <div class='sub' id='a_sub'>tokens saved across all sessions</div></div>
+    <div class='card level'><h3>Total Projects</h3><div class='big' id='p_count'>-</div>
+      <div class='sub' id='p_sub'>tracked in your history</div></div>
   </div>
-  <p class='sub muted' style='margin:6px 0 10px'>On the first request of each session, TokenSnap injects a compact overview of
-    your project (language, framework, structure, git state, README) into the system prompt, so Claude understands the
-    codebase immediately. Below is the most recently generated Project Card.</p>
-  <pre class='log' id='primercard' style='height:auto;max-height:260px'>No card generated yet &mdash; launch Claude Code from a project folder.</pre>
-</div>
 
-<div class='panel'>
-  <div style='display:flex;align-items:center;gap:14px;flex-wrap:wrap'>
-    <h2 style='margin:0'>Live proxy log</h2>
+  <div class='grid cards' style='margin-top:18px'>
+    <div class='card'><h3>Real usage (Anthropic)</h3><div class='big' id='c_real'>-</div>
+      <div class='sub'>in / out tokens (this session)</div></div>
+    <div class='card'><h3>Active model</h3><div class='big' id='c_model' style='font-size:19px'>-</div>
+      <div class='sub'>keep_messages = <span id='c_keep'>-</span></div></div>
+    <div class='card'><h3>Differential Context Engine</h3><div class='big' id='c_ctx' style='font-size:17px'>-</div>
+      <div class='sub' id='c_ctx_sub'>-</div></div>
   </div>
-  <div class='log' id='log' style='margin-top:12px'>waiting for the proxy...</div>
-  <div class='sub muted' style='margin-top:8px'>Memory Cards:
-    <span id='llmpill' class='pill' style='padding:2px 9px;font-size:11px;margin-left:4px'>
-      <span class='dot'></span><span id='llm'>-</span>
-    </span>
+
+  <div class='panel'>
+    <div style='display:flex;align-items:center;gap:14px;flex-wrap:wrap'>
+      <h2 style='margin:0'>Project stats</h2>
+      <span class='sub muted' style='margin-left:auto' id='projhint'></span>
+    </div>
+    <div class='projscroll' id='projects'></div>
+    <div id='projempty' class='empty' style='display:none'>
+      No projects tracked yet. Launch Claude Code from this dashboard or via
+      <b>tokensnap run claude</b> to start tracking.</div>
   </div>
-</div>
+
+  <div class='panel'>
+    <div style='display:flex;align-items:center;gap:14px;flex-wrap:wrap'>
+      <h2 style='margin:0'>Tokens saved over time</h2>
+      <select id='projfilter' class='projfilter' style='margin-left:auto'>
+        <option value=''>All projects</option>
+      </select>
+      <div class='chartbtns' style='margin:0'>
+        <button data-p='day' class='active'>7 days</button>
+        <button data-p='week'>8 weeks</button>
+        <button data-p='month'>6 months</button>
+      </div>
+    </div>
+    <div style='position:relative;height:300px;margin-top:12px'>
+      <canvas id='chart'></canvas>
+      <div id='chartempty' class='empty' style='display:none;position:absolute;inset:0'>
+        No history yet. Once you run <b>tokensnap run claude</b> through the proxy,
+        your savings will appear here.</div>
+    </div>
+  </div>
+
+  <div class='row'>
+    <div class='panel'>
+      <h2>Recent requests</h2>
+      <div style='max-height:320px;overflow:auto'>
+        <table><thead><tr><th>time</th><th>model</th><th class='r'>est.in</th>
+        <th class='r'>saved</th><th class='r'>real.in</th><th class='r'>real.out</th><th class='r'>http</th></tr></thead>
+        <tbody id='recent'><tr><td colspan='7' class='empty'>no requests yet</td></tr></tbody></table>
+      </div>
+    </div>
+  </div>
+
+  <div class='panel'>
+    <div style='display:flex;align-items:center;gap:14px;flex-wrap:wrap'>
+      <h2 style='margin:0'>Project Cortex</h2>
+      <span id='cortexpill' class='pill' style='margin-left:auto'><span class='dot'></span><span id='cortextext'>&hellip;</span></span>
+    </div>
+    <p class='sub muted' style='margin:6px 0 10px'>TokenSnap's persistent second brain for this project: a per-project knowledge
+      base (stack, focus, decisions, resolved issues) injected as immutable Core Memory at the start of every session, plus a
+      Session Bridge that carries context across restarts. Stored in <b>.tokensnap/</b> inside the project.</p>
+    <div style='display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-bottom:10px'>
+      <input type='text' id='cortexfocus' style='flex:1;min-width:260px' placeholder='Current focus / goal for this project'>
+      <button class='btn' id='cortexfocusbtn'>Set focus</button>
+      <button class='btn' id='cortexrefreshbtn'>Refresh DNA</button>
+    </div>
+    <pre class='log' id='cortexcard' style='height:auto;max-height:280px'>Loading&hellip;</pre>
+  </div>
+
+  <div class='panel'>
+    <div style='display:flex;align-items:center;gap:14px;flex-wrap:wrap'>
+      <h2 style='margin:0'>Project Primer</h2>
+      <span id='primerpill' class='pill' style='margin-left:auto'><span class='dot'></span><span id='primertext'>&hellip;</span></span>
+    </div>
+    <p class='sub muted' style='margin:6px 0 10px'>On the first request of each session, TokenSnap injects a compact overview of
+      your project (language, framework, structure, git state, README) into the system prompt, so Claude understands the
+      codebase immediately. Below is the most recently generated Project Card.</p>
+    <pre class='log' id='primercard' style='height:auto;max-height:260px'>No card generated yet &mdash; launch Claude Code from a project folder.</pre>
+  </div>
+
+  <div class='panel'>
+    <div style='display:flex;align-items:center;gap:14px;flex-wrap:wrap'>
+      <h2 style='margin:0'>Live proxy log</h2>
+    </div>
+    <div class='log' id='log' style='margin-top:12px'>waiting for the proxy...</div>
+    <div class='sub muted' style='margin-top:8px'>Memory Cards:
+      <span id='llmpill' class='pill' style='padding:2px 9px;font-size:11px;margin-left:4px'>
+        <span class='dot'></span><span id='llm'>-</span>
+      </span>
+    </div>
+  </div>
+
+  </div>
+</details>
 """
     head_extra = "<script src='https://cdn.jsdelivr.net/npm/chart.js@4'></script>"
     return _shell("TokenSnap Dashboard", "/", body, extra_head=head_extra, foot_js=_DASH_JS)
@@ -961,7 +979,12 @@ async function loadORStatus(){
   catch(e){}
 }
 window.onStats=function(s){
-  // "This Session" level card (volatile stats.json; resets on proxy restart).
+  // Hero number (the one thing everyone sees) + the same figures inside
+  // Advanced's "This Session" card (volatile stats.json; resets on restart).
+  document.getElementById('hero_saved').textContent=fmt(s.tokens_saved);
+  document.getElementById('hero_sub').textContent=s.requests?
+    (fmt(s.requests)+' requests \\u00b7 '+(s.pct||0)+'% smaller \\u00b7 keeps you working longer before hitting a limit'):
+    'Launch Claude Code below to start saving tokens.';
   document.getElementById('s_saved').textContent=fmt(s.tokens_saved);
   document.getElementById('s_sub').textContent=
     fmt(s.requests)+' requests \\u00b7 '+(s.pct||0)+'% of context saved';
@@ -1016,6 +1039,7 @@ async function loadProjects(){
       c.onclick=function(){setProjectFilter(c.dataset.project===projectFilter?'':c.dataset.project);};
     });
     syncFilterOptions(shown);
+    syncProjDirOptions(shown);
   }catch(e){}
 }
 function syncFilterOptions(projects){
@@ -1025,6 +1049,17 @@ function syncFilterOptions(projects){
   }).join('');
   sel.innerHTML=opts;
   sel.value=projectFilter;  // may be '' if the stored project has no rows yet
+}
+// The hero's quick-pick dropdown of previously-used project folders (the
+// free-text box next to it still accepts any path, used or not).
+function syncProjDirOptions(projects){
+  var sel=document.getElementById('projdirselect');
+  var current=document.getElementById('projdir').value.trim();
+  var opts="<option value=''>Choose a project you've used before\\u2026</option>"+projects.map(function(p){
+    return "<option value='"+esc(p.project)+"'>"+esc(projShortName(p.project))+" ("+esc(p.project)+")</option>";
+  }).join('');
+  sel.innerHTML=opts;
+  sel.value=current&&projects.some(function(p){return p.project===current;})?current:'';
 }
 function setProjectFilter(p){
   projectFilter=p||'';
@@ -1101,6 +1136,11 @@ async function applyProjectDir(showToast){
   }catch(e){setProjMsg('Could not set the folder.',false);return false;}
 }
 document.getElementById('setdirbtn').onclick=function(){applyProjectDir(true);};
+document.getElementById('projdirselect').onchange=function(){
+  if(!this.value)return;
+  document.getElementById('projdir').value=this.value;
+  applyProjectDir(true);
+};
 document.getElementById('browsebtn').onclick=async function(){
   var self=this,old=self.textContent;self.disabled=true;self.textContent='Opening\\u2026';
   setProjMsg('A folder picker should have opened - choose a folder.',true);
@@ -1299,6 +1339,22 @@ def _settings_page() -> str:
   <h2 style='font-size:20px'>Settings</h2>
   <p class='muted' style='margin-top:-6px'>Changes are saved immediately and apply to the next request the proxy handles.</p>
 
+  <label class='f'>Compression level</label>
+  <select id='complevel'>
+    <option value='adaptive'>Adaptive (recommended) &mdash; light at first, smarter the longer you work</option>
+    <option value='off'>Off &mdash; never compress (highest fidelity, least token savings)</option>
+    <option value='light'>Light &mdash; always compress a bit</option>
+    <option value='full'>Full &mdash; always maximize token savings</option>
+  </select>
+  <p class='sub muted' style='margin-top:8px'>TokenSnap normally ramps up on its own as a conversation gets longer, so the
+    first replies feel exactly like talking to Claude directly. Leave this on <b>Adaptive</b> unless you have a reason to
+    pin one behavior for every request.</p>
+</div>
+
+<details class='panel' style='max-width:640px'>
+  <summary>Advanced settings <span class='sub muted'>&mdash; the individual knobs Adaptive tunes automatically</span></summary>
+  <div class='advbody'>
+
   <label class='f'>Compression preset</label>
   __PRESET_BUTTONS__
 
@@ -1380,7 +1436,11 @@ def _settings_page() -> str:
     </select>
   </div>
 
-  <div style='display:flex;gap:12px;margin-top:24px;flex-wrap:wrap'>
+  </div>
+</details>
+
+<div class='panel' style='max-width:640px'>
+  <div style='display:flex;gap:12px;flex-wrap:wrap'>
     <button class='btn primary lg' id='save'>Save settings</button>
     <button class='btn lg' id='launchClaudeBtn'>&#128640; Launch Claude Code with current settings</button>
   </div>
@@ -1398,6 +1458,7 @@ _SETTINGS_JS = """
 <script>
 var cfg=window.__TSNAP_CFG__||{};
 var clearKeyRequested=false;
+document.getElementById('complevel').value=cfg.compression_level||'adaptive';
 document.getElementById('keep').value=cfg.keep_messages;
 document.getElementById('selective').value=cfg.selective_compression?'true':'false';
 document.getElementById('compressor_type').value=cfg.compressor_type||'regex';
@@ -1449,7 +1510,8 @@ async function loadORStatus(){
 }
 loadORStatus();setInterval(loadORStatus,10000);
 document.getElementById('save').onclick=async function(){
-  var payload={keep_messages:parseInt(document.getElementById('keep').value,10)||10,
+  var payload={compression_level:document.getElementById('complevel').value,
+    keep_messages:parseInt(document.getElementById('keep').value,10)||10,
     selective_compression:document.getElementById('selective').value,
     compressor_type:document.getElementById('compressor_type').value,
     openrouter_model:document.getElementById('model').value.trim(),

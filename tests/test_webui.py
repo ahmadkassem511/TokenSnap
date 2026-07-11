@@ -158,6 +158,31 @@ class TestContextEngineDashboard:
         assert "id='cortexenabled'" in settings
         assert "id='bridgeinject'" in settings
 
+    def test_settings_page_has_prominent_compression_level_and_advanced_disclosure(self):
+        html = webui._settings_page()
+        assert "id='complevel'" in html
+        # The one dropdown a typical user needs appears BEFORE the collapsed
+        # Advanced section that holds all the individual engine knobs.
+        complevel_pos = html.index("id='complevel'")
+        advanced_pos = html.index("<details")
+        assert complevel_pos < advanced_pos
+        for technical_id in ("keep", "compressor_type", "ctxenabled", "primerenabled",
+                              "cortexenabled", "apikey"):
+            assert html.index("id='%s'" % technical_id) > advanced_pos
+
+    def test_public_config_and_apply_settings_include_compression_level(self):
+        from tokensnap import config as config_mod
+
+        assert webui._public_config()["compression_level"] == "adaptive"
+
+        class FakeRequest:
+            async def json(self_inner):
+                return {"compression_level": "full"}
+
+        asyncio.run(webui._apply_settings(FakeRequest()))
+        assert config_mod.load()["compression_level"] == "full"
+        assert webui._public_config()["compression_level"] == "full"
+
     def _stats_json(self):
         return json.loads(asyncio.run(webui.api_stats(None)).text)
 
@@ -605,7 +630,7 @@ class TestProjectDirEndpoints:
         assert "id='projdir'" in html
         assert "id='browsebtn'" in html
         assert "id='setdirbtn'" in html
-        assert "Project directory" in html
+        assert "id='projdirselect'" in html  # quick-pick dropdown of past projects
         # Wired to the new endpoints.
         assert "/browse-folder" in html
         assert "/set-project-dir" in html
@@ -775,6 +800,37 @@ class TestMultiLevelStatsEndpoints:
         assert "/api/stats/alltime" in html
         assert "/api/stats/projects" in html
         assert "tsnap_project_filter" in html
+
+
+class TestUnifiedDashboard:
+    """A first-time user's default (collapsed) view is just: a savings
+    number, a project picker, and a Launch button - no engine jargon. The
+    richer stats/history/internals panels still exist, tucked behind a
+    collapsed "Advanced" disclosure, not deleted."""
+
+    def test_hero_has_savings_number_project_picker_and_launch_button(self):
+        html = webui._dashboard_page()
+        assert "id='hero_saved'" in html
+        assert "id='projdirselect'" in html
+        assert "id='launchbtn'" in html
+        assert "Launch Claude Code" in html
+
+    def test_engine_jargon_is_confined_to_the_advanced_disclosure(self):
+        html = webui._dashboard_page()
+        hero, _, rest = html.partition("<details")
+        # None of the internal-engine vocabulary leaks into the default view.
+        for term in ("Differential Context Engine", "Memory Card", "Context Tree",
+                     "Project Cortex", "Project Primer", "OpenRouter"):
+            assert term not in hero, "%r leaked into the pre-Advanced hero" % term
+        # It still exists, just inside <details> (collapsed by default).
+        assert "Differential Context Engine" in rest
+        assert "<details" in html and "</details>" in html
+
+    def test_advanced_section_is_collapsed_by_default(self):
+        html = webui._dashboard_page()
+        # A bare <details ...> (no `open` attribute) renders collapsed.
+        assert "<details class='panel' id='advanced'>" in html
+        assert "<details class='panel' id='advanced' open>" not in html
 
 
 class TestCortexEndpoints:
