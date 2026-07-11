@@ -93,6 +93,15 @@ class TestSetValue:
         with pytest.raises(KeyError):
             config_mod.set_value("ollama_model", "x")
 
+    def test_compression_level_defaults_to_adaptive(self):
+        assert config_mod.load()["compression_level"] == "adaptive"
+
+    def test_compression_level_choices_validated(self):
+        assert config_mod.set_value("compression_level", "FULL") == "full"
+        assert config_mod.load()["compression_level"] == "full"
+        with pytest.raises(ValueError):
+            config_mod.set_value("compression_level", "extreme")
+
     @pytest.mark.parametrize(
         "raw,expected",
         [("true", True), ("True", True), ("1", True), ("yes", True), ("on", True),

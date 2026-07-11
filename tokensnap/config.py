@@ -108,6 +108,18 @@ DEFAULTS: Dict[str, Any] = {
     # resolved issues) update every session regardless; only the expensive disk
     # scan is throttled. Default: once per day.
     "dna_update_interval": 86400,
+    # --- Adaptive Transparency Mode -----------------------------------------
+    # TokenSnap normally ramps compression up over a session's lifetime -
+    # requests 1-5 pass through untouched (aside from ANSI cleaning) so early
+    # replies feel exactly like talking to Claude directly, 6-15 add selective
+    # compression plus a tiny project card, and 16+ add the full Differential
+    # Context Engine and Project Cortex. This key lets a user pin one tier for
+    # every request instead of ramping: "adaptive" (default), "off" (always
+    # the transparent tier), "light", or "full". Everyone else never needs to
+    # touch this - the engines it orchestrates (compressor_type,
+    # context_store_enabled, project_primer_enabled, project_cortex_enabled,
+    # etc.) remain available underneath for advanced tuning.
+    "compression_level": "adaptive",
     # Optional stored API key (normally unused: the proxy forwards the
     # key Claude Code already sends in request headers)
     "key": "",
@@ -136,6 +148,7 @@ _TYPES = {
 # Keys restricted to a fixed set of values
 _CHOICES = {
     "compressor_type": ("openrouter", "regex", "off"),
+    "compression_level": ("adaptive", "off", "light", "full"),
 }
 
 # Pre-0.3 config key names, kept working so old muscle memory / scripts and

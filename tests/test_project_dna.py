@@ -66,6 +66,36 @@ class TestStaticAnalysis:
         assert "node_modules/" not in static["folder_structure"]
 
 
+class TestCompactCard:
+    def test_compact_card_has_only_four_fields(self, tmp_path):
+        _make_project(tmp_path)
+        card = dna.get_compact_card(str(tmp_path))
+        assert set(card.keys()) == {"project_name", "language", "entry_points", "readme_summary"}
+        assert card["language"] == "Python"
+        assert "main.py" in card["entry_points"]
+        # Framework/dependencies are deliberately NOT in the compact card.
+        assert "framework" not in card
+        assert "key_dependencies" not in card
+
+    def test_compact_card_unknown_dir_is_empty(self):
+        card = dna.get_compact_card("/no/such/dir/xyz")
+        assert card["project_name"] == ""
+        assert card["entry_points"] == []
+
+    def test_format_compact_card_is_small_and_labelled(self, tmp_path):
+        _make_project(tmp_path)
+        block = dna.format_compact_card(dna.get_compact_card(str(tmp_path)))
+        assert "PROJECT CARD" in block
+        assert len(block) <= dna._COMPACT_CARD_CHAR_CAP + 64
+        # Meaningfully smaller than the full Core Memory block.
+        full = dna.format_core_memory(dna.ensure_dna(str(tmp_path), {"dna_update_interval": 86400}))
+        assert len(block) < len(full)
+
+    def test_format_compact_card_empty_renders_nothing(self):
+        assert dna.format_compact_card({}) == ""
+        assert dna.format_compact_card({"project_name": "", "language": ""}) == ""
+
+
 class TestEnsureDna:
     def test_ensure_generates_and_persists_static(self, tmp_path):
         _make_project(tmp_path)

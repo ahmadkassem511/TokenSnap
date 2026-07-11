@@ -149,6 +149,37 @@ def get_static_dna(project_dir: str) -> Dict[str, Any]:
     }
 
 
+_COMPACT_CARD_CHAR_CAP = 1200  # ~300 tokens
+
+
+def get_compact_card(project_dir: str) -> Dict[str, Any]:
+    """A minimal project overview for Adaptive Transparency Mode's LIGHT tier:
+    just enough for the model to orient itself, kept far smaller than the full
+    Core Memory block. Reuses the same scanners as :func:`get_static_dna` so
+    the two never disagree about a project's basic facts. Never raises."""
+    if not project_dir or not os.path.isdir(project_dir):
+        return {"project_name": "", "language": "", "entry_points": [], "readme_summary": ""}
+    card = project_primer.generate_project_card(project_dir)
+    return {
+        "project_name": card.get("project_name", ""),
+        "language": card.get("language", ""),
+        "entry_points": _detect_entry_points(project_dir),
+        "readme_summary": card.get("readme_summary", ""),
+    }
+
+
+def format_compact_card(card: Dict[str, Any]) -> str:
+    """Render the compact card as a small system-prompt block (<=~300 tokens).
+    Returns "" when there's nothing worth injecting."""
+    payload = {k: v for k, v in card.items() if v}
+    if not payload:
+        return ""
+    body = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    if len(body) > _COMPACT_CARD_CHAR_CAP:
+        body = body[:_COMPACT_CARD_CHAR_CAP] + "…"
+    return "[TOKENSNAP PROJECT CARD]\n" + body
+
+
 def ensure_dna(
     project_dir: str, cfg: Optional[Dict[str, Any]] = None
 ) -> Dict[str, Any]:
