@@ -117,7 +117,14 @@ async def api_stats(request: web.Request) -> web.Response:
     active_model = recent[-1]["model"] if recent else "-"
     # Differential Context Engine one-liner, matching the wording used by
     # `tokensnap status` / `tokensnap monitor` so all three read the same.
-    ctx_enabled = bool(cfg.get("context_store_enabled", False))
+    # Reflects real usage, not just the static override: under Adaptive
+    # Transparency Mode the engine also switches on by itself once a session
+    # reaches the FULL tier, which context_requests > 0 already captures
+    # (record_request sets context_store=True whenever it actually ran).
+    ctx_enabled = (
+        bool(cfg.get("context_store_enabled", False))
+        or totals.get("context_requests", 0) > 0
+    )
     context_status = (
         "enabled (tree size: %d)" % int(cfg.get("context_tree_size", 20))
         if ctx_enabled else "disabled"
@@ -237,11 +244,13 @@ async def api_context(request: web.Request) -> web.Response:
     Context Store, and the tokens/recalls it has accounted for this session."""
     cfg = config_mod.load()
     totals = stats.load()["totals"]
+    context_requests = totals.get("context_requests", 0)
     return web.json_response({
-        "enabled": bool(cfg.get("context_store_enabled", False)),
+        # Reflects real usage, not just the static override - see api_stats.
+        "enabled": bool(cfg.get("context_store_enabled", False)) or context_requests > 0,
         "tree_size": int(cfg.get("context_tree_size", 20)),
         "events_stored": context_store.event_count(),
-        "context_requests": totals.get("context_requests", 0),
+        "context_requests": context_requests,
         "tokens_saved": totals.get("context_saved", 0),
         "events_fetched": totals.get("context_events_fetched", 0),
     })

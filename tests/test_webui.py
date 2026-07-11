@@ -81,6 +81,20 @@ class TestContextEngineDashboard:
         assert data["enabled"] is True
         assert data["events_stored"] == 2
 
+    def test_reports_enabled_when_adaptive_full_tier_used_it(self):
+        # context_store_enabled stays at its default (False) - only Adaptive
+        # Transparency Mode's FULL tier actually triggered the engine. The
+        # status must reflect that real usage, not just the static override
+        # (which is what the proxy's own record_request(context_store=True)
+        # call reports whenever the engine actually ran for a request).
+        webui.stats.mark_started("127.0.0.1", 8889)
+        webui.stats.record_request("/v1/messages", "m", 100, 40, 200, 0.1,
+                                   context_store=True)
+        data = self._context_json()
+        assert data["enabled"] is True
+        cfg = webui.config_mod.load()
+        assert cfg["context_store_enabled"] is False  # the override was never touched
+
     def test_public_config_includes_context_keys(self):
         cfg = webui._public_config()
         assert cfg["context_store_enabled"] is False
@@ -202,6 +216,21 @@ class TestContextEngineDashboard:
         assert data["context_store_enabled"] is True
         assert data["context_tree_size"] == 42
         assert data["context_status"] == "enabled (tree size: 42)"
+
+    def test_api_stats_shows_enabled_when_adaptive_full_tier_used_it(self):
+        # The static config toggle is untouched (still the default, False) -
+        # only a request that actually went through the engine (as Adaptive
+        # Transparency Mode's FULL tier does automatically for long sessions)
+        # happened. The dashboard's card must reflect that real activity, not
+        # just the static override - otherwise it would wrongly say "disabled"
+        # for a session that is, right now, using the engine.
+        webui.stats.mark_started("127.0.0.1", 8889)
+        webui.stats.record_request("/v1/messages", "m", 100, 40, 200, 0.1,
+                                   context_store=True)
+        data = self._stats_json()
+        assert data["context_status"] == "enabled (tree size: 20)"
+        cfg = webui.config_mod.load()
+        assert cfg["context_store_enabled"] is False  # the override itself never changed
 
     def test_dashboard_page_has_context_engine_card(self):
         html = webui._dashboard_page()

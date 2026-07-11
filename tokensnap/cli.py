@@ -159,7 +159,14 @@ def _build_dashboard(cfg: dict) -> Panel:
             format(totals["real_cache_creation"], ","),
         ),
     )
-    ctx_enabled = bool(cfg.get("context_store_enabled", False))
+    # Reflects real usage, not just the static override: under Adaptive
+    # Transparency Mode the engine also switches on by itself once a session
+    # reaches the FULL tier, which context_requests > 0 already captures
+    # (record_request sets context_store=True whenever it actually ran).
+    ctx_enabled = (
+        bool(cfg.get("context_store_enabled", False))
+        or totals.get("context_requests", 0) > 0
+    )
     ctx_text = (
         "Differential Context Engine: [bold green]enabled[/bold green] (tree size: %d)"
         % int(cfg.get("context_tree_size", 20))
@@ -285,7 +292,8 @@ def status() -> None:
             " (since %Y-%m-%d %H:%M:%S)"
         )
     llm_status = data.get("llm_status") or "not started yet"
-    if bool(cfg.get("context_store_enabled", False)):
+    # Reflects real usage, not just the static override - see _build_dashboard.
+    if bool(cfg.get("context_store_enabled", False)) or totals.get("context_requests", 0) > 0:
         ctx_status = "[bold green]enabled[/bold green] (tree size: %d)" % int(
             cfg.get("context_tree_size", 20)
         )
