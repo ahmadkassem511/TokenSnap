@@ -63,6 +63,24 @@ class TestEventClassification:
     def test_other(self):
         assert ce.event_type_for("sounds good, thanks") == "other"
 
+    def test_plain_user_request_falls_back_to_request_not_other(self):
+        # A genuine ask that matches none of the categories above must never
+        # be classified 'other' (dropped from the tree) - it falls back to
+        # 'request' instead, so the model never loses track of what it was
+        # asked to do (see the Adaptive Transparency Mode bug report).
+        assert ce.event_type_for("read this project and run it", is_user_request=True) == "request"
+        assert ce.event_type_for("run video_pipeline.py for me", is_user_request=True) == "request"
+
+    def test_more_specific_category_still_wins_over_request(self):
+        # is_user_request is only the *fallback*; a real decision/error/etc
+        # phrasing still takes priority even from a genuine user message.
+        assert ce.event_type_for("Decision: use SQLite", is_user_request=True) == "decision"
+
+    def test_non_request_messages_unaffected(self):
+        # Assistant chatter / tool output must still fall to 'other', not
+        # 'request' - only genuine user asks get the fallback protection.
+        assert ce.event_type_for("sounds good, thanks", is_user_request=False) == "other"
+
 
 class TestOneLineSummary:
     def test_first_nonempty_line(self):
@@ -109,6 +127,26 @@ class TestIngest:
         ce.ingest(sid, msgs)
         tree = context_store.get_recent_tree(sid)
         assert any(e["type"] == "error" for e in tree)
+
+    def test_plain_user_ask_surfaces_as_request_not_dropped(self):
+        sid = "sess"
+        msgs = [{"role": "user", "content": "read this project and run it"}]
+        ce.ingest(sid, msgs)
+        tree = context_store.get_recent_tree(sid)
+        assert tree == [{"id": "1", "summary": "read this project and run it", "type": "request"}]
+
+    def test_tool_result_only_user_message_stays_other_not_request(self):
+        # A tool_result carries role="user" per the API, but it's mechanical
+        # output, not a genuine ask - it must not get the request fallback,
+        # or the tree would fill with noise instead of real instructions.
+        sid = "sess"
+        msgs = [{"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "t1", "content": "some plain tool output"}
+        ]}]
+        ce.ingest(sid, msgs)
+        assert context_store.get_recent_tree(sid) == []  # correctly excluded as 'other'
+        ev = context_store.get_first_event(sid)
+        assert ev["type"] == "other"
 
 
 class TestContextTreeBlock:
@@ -184,9 +222,12 @@ class TestReconstruct:
     def test_original_task_never_lost_even_when_unclassifiable(self):
         # Regression test: a plainly-phrased first request ("run this tool")
         # doesn't match any of the decision/error/file-mod/clarification
-        # regexes, so get_recent_tree alone would classify it 'other' and
-        # drop it with no trace once it falls into the omitted head - unlike
-        # the classic Memory Card, which always captures `task` regardless of
+        # regexes. A genuine user ask now falls back to the 'request' event
+        # type (not 'other'), so get_recent_tree already keeps it - and
+        # get_first_event backstops message 0 specifically even if that
+        # somehow failed. Before either fix, this would classify 'other' and
+        # drop with no trace once it fell into the omitted head - unlike the
+        # classic Memory Card, which always captures `task` regardless of
         # phrasing. The model would then have no way to recover what it was
         # even asked to do (the exact bug reported: "the only thing I can
         # recover is system boilerplate, not your request").
@@ -200,9 +241,11 @@ class TestReconstruct:
         sid = ce.derive_session_id(system, msgs)
         ce.ingest(sid, msgs)
 
-        # Confirm the bug's precondition: get_recent_tree alone is empty -
-        # nothing in this history matches decision/error/file-mod/clarify.
-        assert context_store.get_recent_tree(sid, 20) == []
+        # The task is classified 'request' (a genuine user ask), not 'other' -
+        # nothing in this history matches decision/error/file-mod/clarify, but
+        # get_recent_tree already keeps it via that classification alone.
+        tree = context_store.get_recent_tree(sid, 20)
+        assert tree == [{"id": "1", "summary": "run video_pipeline.py for me", "type": "request"}]
 
         _, new_sys, reconstructed, n_omitted = ce.reconstruct(
             msgs, system, sid, tree_size=20, min_messages=8, keep_exchanges=5
@@ -211,6 +254,61 @@ class TestReconstruct:
         assert n_omitted > 0  # the task message did fall into the omitted head
         text = new_sys if isinstance(new_sys, str) else str(new_sys)
         assert "run video_pipeline.py for me" in text
+        assert '"type":"request"' in text.replace(" ", "")
+
+    def test_second_instruction_not_just_the_first_is_preserved(self):
+        # The exact shape from the real bug report: the OPERATIVE instruction
+        # is the *second* user message (the first was a vague ask that got a
+        # clarifying question), buried among many tool round-trips after it.
+        # get_first_event alone (the earlier, narrower fix) only protects
+        # message 0 - this proves every genuine user ask is protected, not
+        # just the first.
+        system = "sys"
+        msgs = [
+            {"role": "user", "content": "run this tool on another terminal"},
+            {"role": "assistant", "content": "I don't have context on which tool - could you clarify?"},
+            {"role": "user", "content": "read this project and know how it works and run it"},
+        ]
+        for i in range(15):
+            msgs.append({"role": "assistant", "content": [
+                {"type": "tool_use", "id": "t%d" % i, "name": "Bash", "input": {}}]})
+            msgs.append({"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t%d" % i, "content": "ok %d" % i}]})
+        sid = ce.derive_session_id(system, msgs)
+        ce.ingest(sid, msgs)
+
+        _, new_sys, reconstructed, n_omitted = ce.reconstruct(
+            msgs, system, sid, tree_size=20, min_messages=8, keep_exchanges=5
+        )
+        assert reconstructed is True
+        text = new_sys if isinstance(new_sys, str) else str(new_sys)
+        assert "read this project and know how it works and run it" in text
+
+    def test_first_event_backstop_when_tree_size_pushes_task_out(self):
+        # get_first_event's backstop (relabeled "task") only matters in the
+        # rarer case where the tree's recency LIMIT itself pushes message 0
+        # out - e.g. many later decisions crowd a small tree_size. Construct
+        # exactly that: more 'important' events after message 0 than tree_size.
+        system = "sys"
+        msgs = [{"role": "user", "content": "the original task, phrased plainly"}]
+        for i in range(10):
+            msgs.append({"role": "assistant", "content": "Decision: use approach %d" % i})
+            msgs.append({"role": "user", "content": "ok %d" % i})
+        sid = ce.derive_session_id(system, msgs)
+        ce.ingest(sid, msgs)
+
+        # With a tiny tree_size, get_recent_tree alone drops message 0 (10
+        # later decisions already fill the limit).
+        assert not any(
+            e["summary"] == "the original task, phrased plainly"
+            for e in context_store.get_recent_tree(sid, 3)
+        )
+
+        _, new_sys, reconstructed, n_omitted = ce.reconstruct(
+            msgs, system, sid, tree_size=3, min_messages=8, keep_exchanges=1
+        )
+        text = new_sys if isinstance(new_sys, str) else str(new_sys)
+        assert "the original task, phrased plainly" in text
         assert '"type":"task"' in text.replace(" ", "")
 
     def test_task_not_duplicated_when_already_classified(self):

@@ -32,9 +32,14 @@ _FILE_RE = re.compile(
     r"(?:py|pyi|js|jsx|ts|tsx|json|md|txt|yaml|yml|toml|ini|cfg|html|css|scss"
     r"|sh|bat|ps1|go|rs|java|kt|c|cc|cpp|h|hpp|cs|rb|php|sql|proto|xml|lock)\b"
 )
-# Lines that record a choice or direction
+# Lines that record a choice or direction. The "decision/decided/plan:" branch
+# is split out of the trailing \b(...)\b group: a word-boundary can never
+# follow a colon (both neighboring characters are non-word), so a shared
+# trailing \b would silently never match "Decision: ..." - the single most
+# common explicit way both users and Claude phrase a decision.
 _DECISION_RE = re.compile(
-    r"(?i)\b(decision:|we will|we'll|let's use|i'll use|going with|chose|"
+    r"(?i)\b(?:decision|decided|plan)\s*:"
+    r"|\b(?:we will|we'll|let's use|i'll use|going with|chose|"
     r"decided to|instead of using|switching to|opted for)\b"
 )
 # Error mentions and their resolutions

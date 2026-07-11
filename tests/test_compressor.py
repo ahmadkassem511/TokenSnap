@@ -321,6 +321,20 @@ class TestBuildMemoryCard:
         assert card["files_modified"] == []
         assert card["messages_summarized"] == 0
 
+    def test_labelled_decision_line_is_captured(self):
+        # Regression test: _DECISION_RE's "decision:" alternative previously
+        # had a trailing \b that can never match right after a colon (both
+        # neighboring chars are non-word), so a bare "Decision: X" line -
+        # arguably the single most common way to phrase one - was silently
+        # never captured unless it also happened to contain phrasing like
+        # "we will". Verify all three labelled prefixes now work standalone.
+        for line in ("Decision: use SQLite for storage",
+                     "Decided: use SQLite for storage",
+                     "Plan: use SQLite for storage"):
+            msgs = _exchange("what should we use for storage?", line)
+            card = compressor.build_memory_card(msgs)
+            assert card["decisions"], "not captured: %r" % line
+
 
 class TestMessageWeight:
     def test_assistant_outweighs_tool_result(self):

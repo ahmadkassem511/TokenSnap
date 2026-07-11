@@ -40,7 +40,10 @@ DB_FILE = config_mod.CONFIG_DIR / "context_store.db"
 
 # Event categories used to decide what belongs in the Context Tree. Anything
 # not "other" is considered important enough to surface (see get_recent_tree).
-EVENT_TYPES = ("decision", "error", "file_modification", "clarification", "other")
+# "request" marks a genuine user instruction that didn't match a more
+# specific category - it must still never be dropped as noise the way
+# assistant chatter/tool-result "other" events are.
+EVENT_TYPES = ("decision", "error", "file_modification", "clarification", "request", "other")
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS events (

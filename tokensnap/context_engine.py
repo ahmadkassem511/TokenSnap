@@ -24,7 +24,12 @@ import re
 from typing import Any, Dict, List, Optional, Tuple
 
 from tokensnap import compressor, context_store
-from tokensnap.utils import append_to_system, message_text, system_to_parts
+from tokensnap.utils import (
+    append_to_system,
+    is_tool_result_only,
+    message_text,
+    system_to_parts,
+)
 
 # Number of recent user/assistant exchanges (a pair == 2 messages) kept
 # verbatim ahead of the Context Tree. The spec fixes this at "the last 2".
@@ -91,12 +96,22 @@ def derive_session_id(system: Any, messages: List[Dict[str, Any]]) -> str:
     return hashlib.sha1(seed.encode("utf-8", "replace")).hexdigest()[:16]
 
 
-def event_type_for(text: str) -> str:
+def event_type_for(text: str, is_user_request: bool = False) -> str:
     """Classify a message into a Context-Tree event type by simple heuristics.
 
     Order is by importance: an error mention wins over a file edit, which wins
     over a decision, which wins over a clarification; anything else is 'other'
-    (and thus excluded from the tree)."""
+    (excluded from the tree) - UNLESS ``is_user_request`` is set, in which case
+    it falls back to 'request' (kept) instead.
+
+    ``is_user_request`` marks a message as a genuine user instruction (a real
+    ask, not a tool_result and not assistant chatter). Plainly-phrased
+    requests ("read this project and run it") rarely match the categories
+    above, but the model must never lose track of what it was actually asked
+    to do - the classic Memory Card already guarantees this via its `task`
+    field; the Context Tree needs the same guarantee for *every* user ask, not
+    just the first (see ``get_first_event`` in context_store.py for the
+    first-message backstop this complements)."""
     if compressor._ERROR_RE.search(text):
         return "error"
     if _FILE_MOD_RE.search(text):
@@ -105,7 +120,7 @@ def event_type_for(text: str) -> str:
         return "decision"
     if _CLARIFY_RE.search(text):
         return "clarification"
-    return "other"
+    return "request" if is_user_request else "other"
 
 
 def one_line_summary(text: str, maxlen: int = _SUMMARY_MAX) -> str:
@@ -132,8 +147,10 @@ def ingest(session_id: str, messages: List[Dict[str, Any]]) -> int:
         if not text.strip():
             continue
         role = str(m.get("role", "user"))
+        is_user_request = role == "user" and not is_tool_result_only(m)
         context_store.store_message(
-            session_id, i, role, text, one_line_summary(text), event_type_for(text)
+            session_id, i, role, text, one_line_summary(text),
+            event_type_for(text, is_user_request=is_user_request),
         )
         stored += 1
     return stored

@@ -386,17 +386,19 @@ for every request, independent of tier.
    local SQLite database (`~/.tokensnap/context_store.db`), keyed by its
    position so re-sends of the same conversation never duplicate it. Each
    message is tagged with an `event_type` (`decision`, `error`,
-   `file_modification`, `clarification`, or `other`).
+   `file_modification`, `clarification`, `request`, or `other`). Any genuine
+   user instruction that doesn't match a more specific category (a plainly
+   phrased "read this project and run it") is tagged `request`, not `other` —
+   `other` is reserved for assistant chatter and tool-result noise. This
+   guarantees **every real ask survives** in the tree, not just things phrased
+   as a decision or error; the conversation's very first message additionally
+   gets a hard backstop (labeled `"type":"task"`) in the rare case the tree's
+   recency limit itself pushes it out.
 2. **Reconstruct.** The outgoing request keeps only the last few exchanges
    verbatim (after selective compression). Everything older is replaced by a
    single system block holding the **Context Tree** — a JSON array of
    `{id, summary, type}` for the most recent important events
    (`context_tree_size`, default 20) — plus a `fetch_context` tool definition.
-   The conversation's **original task is always included** in the tree
-   (labeled `"type":"task"`), even if it doesn't happen to read like a
-   decision/error/file-modification — otherwise a plainly-phrased first
-   request could fall out of the tree with no trace once it ages past the
-   kept tail, leaving the model unable to recover what it was even asked to do.
 3. **Recall.** If the model calls `fetch_context` with some event ids, the
    *proxy* answers it — it looks the events up in the mirror, feeds their full
    text back as a `tool_result`, and continues the turn upstream itself. Claude

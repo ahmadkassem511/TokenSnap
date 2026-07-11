@@ -143,7 +143,30 @@ class TestDifferentialContextPath:
         system = new_body["system"]
         text = system if isinstance(system, str) else str(system)
         assert "CONTEXT TREE" in text
-        # Fewer estimated tokens than the original.
+        # NOTE: no "fewer tokens than original" assertion here - _long_history
+        # is 20 *distinct* short user asks in a row (every one now correctly
+        # preserved as a "request" event, not silently dropped as "other"), so
+        # the tree legitimately reproduces most of the original content in
+        # this degenerate synthetic shape. See the realistic-shape test below
+        # for the actual token-savings guarantee.
+
+    def test_realistic_tool_heavy_session_still_saves_tokens(self):
+        # A shape that matches real agentic usage - one real ask followed by
+        # many tool_use/tool_result round-trips (correctly excluded as noise,
+        # unlike the ask itself) - proves the engine still saves real tokens
+        # once user-request preservation is accounted for.
+        msgs = [{"role": "user", "content": "read this project and know how it works and run it"}]
+        for i in range(20):
+            msgs.append({"role": "assistant", "content": [
+                {"type": "tool_use", "id": "t%d" % i, "name": "Bash", "input": {"command": "ls"}}]})
+            msgs.append({"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t%d" % i,
+                 "content": "a long directory listing " * 20}]})
+        body = {"model": "claude-sonnet-5", "messages": msgs}
+        new_body, meta = optimize_body(body, _cfg(context_store_enabled=True))
+        assert meta["context_store"] is True
+        text = str(new_body.get("system"))
+        assert "read this project and know how it works and run it" in text
         assert meta["after"] < meta["before"]
 
     def test_events_are_persisted_to_the_store(self):
