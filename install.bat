@@ -8,7 +8,7 @@ REM ============================================================
 cd /d "%~dp0"
 
 echo.
-echo === Tokensnap v2 installer ===
+echo === TokenSnap installer ===
 echo.
 
 REM --- 1. Find Python ---------------------------------------
@@ -73,13 +73,8 @@ if /i "%ADDPATH%"=="y" (
 )
 
 echo.
-set /p OPENDASH="Do you want to open the setup dashboard now? [Y/n] "
-if /i not "%OPENDASH%"=="n" (
-    echo Starting the dashboard in the background - it will open in your browser...
-    start "" ".venv\Scripts\tokensnap.exe" dashboard
-) else (
-    echo Skipped. Start it later with: tokensnap dashboard
-)
+echo Opening the TokenSnap dashboard - it will open in your browser...
+start "" ".venv\Scripts\tokensnap.exe" dashboard
 
 echo.
 echo Creating a desktop shortcut for the dashboard...
@@ -126,15 +121,9 @@ if errorlevel 1 (
 )
 
 echo.
-echo Quickstart:
-echo   tokensnap dashboard        (web UI: setup wizard, charts ^& settings)
-echo   tokensnap start            (start the proxy)
-echo   tokensnap run claude       (launch Claude Code through the proxy)
-echo   tokensnap monitor          (live savings dashboard, terminal)
-echo   tokensnap preset smart     (activate intelligent selective compression)
+echo The dashboard is open in your browser - pick a project folder and click
+echo "Launch Claude Code" to get started.
 echo.
-echo For best quality: run 'tokensnap preset smart' once.
-echo Optionally, get a free OpenRouter key ^(https://openrouter.ai/keys^)
-echo to enable AI-powered Memory Cards: tokensnap config set openrouter_api_key YOUR_KEY
+echo (Advanced options and command-line usage: see ADVANCED.md)
 echo.
 pause
