@@ -181,6 +181,55 @@ class TestReconstruct:
         # The context tree is present and references stored event ids.
         assert "fetch_context" in (new_sys if isinstance(new_sys, str) else str(new_sys))
 
+    def test_original_task_never_lost_even_when_unclassifiable(self):
+        # Regression test: a plainly-phrased first request ("run this tool")
+        # doesn't match any of the decision/error/file-mod/clarification
+        # regexes, so get_recent_tree alone would classify it 'other' and
+        # drop it with no trace once it falls into the omitted head - unlike
+        # the classic Memory Card, which always captures `task` regardless of
+        # phrasing. The model would then have no way to recover what it was
+        # even asked to do (the exact bug reported: "the only thing I can
+        # recover is system boilerplate, not your request").
+        system = "sys"
+        msgs = [{"role": "user", "content": "run video_pipeline.py for me"}]
+        for i in range(15):
+            msgs.append({"role": "assistant", "content": "checking things, step %d" % i})
+            msgs.append({"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t%d" % i, "content": "ok output %d" % i}
+            ]})
+        sid = ce.derive_session_id(system, msgs)
+        ce.ingest(sid, msgs)
+
+        # Confirm the bug's precondition: get_recent_tree alone is empty -
+        # nothing in this history matches decision/error/file-mod/clarify.
+        assert context_store.get_recent_tree(sid, 20) == []
+
+        _, new_sys, reconstructed, n_omitted = ce.reconstruct(
+            msgs, system, sid, tree_size=20, min_messages=8, keep_exchanges=5
+        )
+        assert reconstructed is True
+        assert n_omitted > 0  # the task message did fall into the omitted head
+        text = new_sys if isinstance(new_sys, str) else str(new_sys)
+        assert "run video_pipeline.py for me" in text
+        assert '"type":"task"' in text.replace(" ", "")
+
+    def test_task_not_duplicated_when_already_classified(self):
+        # If the opening message happens to also match a real event type
+        # (e.g. it reads as a decision), get_first_event's entry must not be
+        # duplicated alongside get_recent_tree's own entry for the same id.
+        system = "sys"
+        msgs = [{"role": "user", "content": "Decision: we will use FFmpeg for video_pipeline.py"}]
+        for i in range(15):
+            msgs.append({"role": "assistant", "content": "step %d" % i})
+            msgs.append({"role": "user", "content": "ok %d" % i})
+        sid = ce.derive_session_id(system, msgs)
+        ce.ingest(sid, msgs)
+        _, new_sys, _, _ = ce.reconstruct(
+            msgs, system, sid, tree_size=20, min_messages=8, keep_exchanges=5
+        )
+        text = new_sys if isinstance(new_sys, str) else str(new_sys)
+        assert text.count("FFmpeg") == 1  # present once, not duplicated
+
     def test_orphaned_tool_result_converted(self):
         # Craft a history whose cut lands on a tool_result-only user message.
         system = "sys"

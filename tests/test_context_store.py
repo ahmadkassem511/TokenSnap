@@ -133,6 +133,42 @@ class TestRecentTree:
         assert ev["content"] == "the full text"
 
 
+class TestFirstEvent:
+    """get_first_event guarantees the original task is always recoverable,
+    unlike get_recent_tree which drops anything classified 'other'."""
+
+    def test_empty_session_is_none(self):
+        assert context_store.get_first_event("nobody") is None
+
+    def test_returns_earliest_regardless_of_type(self):
+        # The opening message is 'other' - get_recent_tree would exclude it
+        # entirely, but get_first_event must still surface it.
+        _store(0, summary="run video_pipeline.py for me", event_type="other")
+        _store(1, summary="a decision", event_type="decision")
+        first = context_store.get_first_event("s1")
+        assert first["summary"] == "run video_pipeline.py for me"
+        assert first["type"] == "other"
+
+    def test_ignores_insertion_order_uses_message_index(self):
+        # Stored out of order; the earliest *index*, not the first write, wins.
+        _store(2, summary="third", event_type="other")
+        _store(0, summary="first", event_type="other")
+        _store(1, summary="second", event_type="other")
+        assert context_store.get_first_event("s1")["summary"] == "first"
+
+    def test_only_id_summary_type_keys(self):
+        _store(0, summary="task", event_type="other")
+        entry = context_store.get_first_event("s1")
+        assert set(entry.keys()) == {"id", "summary", "type"}
+        assert isinstance(entry["id"], str)
+
+    def test_session_isolation(self):
+        _store(0, summary="a", event_type="other", session="s1")
+        _store(0, summary="b", event_type="other", session="s2")
+        assert context_store.get_first_event("s1")["summary"] == "a"
+        assert context_store.get_first_event("s2")["summary"] == "b"
+
+
 class TestFullHistory:
     def test_includes_other_and_orders(self):
         _store(2, content="c", event_type="other")
@@ -178,4 +214,5 @@ class TestNeverRaises:
         assert context_store.get_recent_tree("s1") == []
         assert context_store.get_full_history("s1") == []
         assert context_store.get_event_by_id(1) is None
+        assert context_store.get_first_event("s1") is None
         assert context_store.event_count() == 0

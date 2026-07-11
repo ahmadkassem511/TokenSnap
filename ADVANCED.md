@@ -392,6 +392,11 @@ for every request, independent of tier.
    single system block holding the **Context Tree** — a JSON array of
    `{id, summary, type}` for the most recent important events
    (`context_tree_size`, default 20) — plus a `fetch_context` tool definition.
+   The conversation's **original task is always included** in the tree
+   (labeled `"type":"task"`), even if it doesn't happen to read like a
+   decision/error/file-modification — otherwise a plainly-phrased first
+   request could fall out of the tree with no trace once it ages past the
+   kept tail, leaving the model unable to recover what it was even asked to do.
 3. **Recall.** If the model calls `fetch_context` with some event ids, the
    *proxy* answers it — it looks the events up in the mirror, feeds their full
    text back as a `tool_result`, and continues the turn upstream itself. Claude

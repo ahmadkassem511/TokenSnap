@@ -190,6 +190,38 @@ def get_recent_tree(session_id: str, limit: int = 20) -> List[Dict[str, Any]]:
     ]
 
 
+def get_first_event(session_id: str) -> Optional[Dict[str, Any]]:
+    """Return the earliest-indexed stored event for ``session_id`` - almost
+    always the conversation's opening message, i.e. the original task -
+    regardless of its ``event_type``.
+
+    Unlike :func:`get_recent_tree`, this never filters by type: the Context
+    Tree only surfaces 'important' (non-'other') events, which silently drops
+    a plainly-phrased request ("run this tool") that doesn't happen to match
+    the decision/error/file-modification/clarification heuristics. The caller
+    uses this to guarantee the original task is never entirely lost from the
+    tree, the same way the classic Memory Card always captures ``task``
+    regardless of phrasing. None if nothing is stored. Never raises.
+    """
+    try:
+        conn = _connect()
+        try:
+            conn.executescript(_SCHEMA)
+            row = conn.execute(
+                "SELECT id, summary, event_type FROM events "
+                "WHERE session_id = ? ORDER BY message_index ASC LIMIT 1",
+                (str(session_id),),
+            ).fetchone()
+        finally:
+            conn.close()
+    except (sqlite3.Error, OSError) as exc:
+        log.debug("context_store.get_first_event failed (%s)", exc)
+        return None
+    if not row:
+        return None
+    return {"id": str(row["id"]), "summary": row["summary"], "type": row["event_type"]}
+
+
 def get_full_history(
     session_id: str, limit: Optional[int] = None
 ) -> List[Dict[str, Any]]:

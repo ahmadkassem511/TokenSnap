@@ -200,6 +200,16 @@ def reconstruct(
         tail = [compressor._compress_message_selectively(m) for m in tail]
 
     tree = context_store.get_recent_tree(session_id, tree_size)
+    # Guarantee the original task is never entirely lost. get_recent_tree only
+    # surfaces 'important' (non-'other') events, so a plainly-phrased request
+    # ("run this tool") that doesn't match the decision/error/file-mod/
+    # clarification heuristics would otherwise vanish with no trace once its
+    # message falls into the omitted head - unlike the classic Memory Card,
+    # which always captures `task` from the first message regardless of
+    # phrasing. Prepend it (labeled distinctly) unless it's already present.
+    task_event = context_store.get_first_event(session_id)
+    if task_event and not any(e["id"] == task_event["id"] for e in tree):
+        tree = [dict(task_event, type="task")] + tree
     block = build_context_tree_block(tree, n_omitted=len(head))
     new_system = append_to_system(system, block)
     return tail, new_system, True, len(head)

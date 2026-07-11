@@ -160,6 +160,26 @@ class TestDifferentialContextPath:
         assert "tools" not in new_body  # nothing omitted -> no tool advertised
         assert len(new_body["messages"]) == 4
 
+    def test_original_task_survives_a_long_ordinary_conversation(self):
+        # Regression test for a real bug report: a plainly-phrased first
+        # request ("run video_pipeline.py for me") that never matches the
+        # decision/error/file-mod/clarification heuristics used to vanish
+        # completely from the Context Tree once the conversation grew past
+        # it, leaving the model unable to recover what it was even asked to
+        # do. Reproduces that exact shape through the full proxy path.
+        msgs = [{"role": "user", "content": "run video_pipeline.py for me"}]
+        for i in range(15):
+            msgs.append({"role": "assistant", "content": "checking things, step %d" % i})
+            msgs.append({"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t%d" % i, "content": "ok output %d" % i}
+            ]})
+        body = {"model": "claude-sonnet-5", "messages": msgs}
+        new_body, meta = optimize_body(body, _cfg(context_store_enabled=True))
+        assert meta["context_store"] is True
+        assert meta["compressed"] is True
+        text = str(new_body.get("system"))
+        assert "run video_pipeline.py for me" in text
+
     def test_existing_tools_are_preserved(self):
         body = {
             "model": "claude-sonnet-5",
