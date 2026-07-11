@@ -22,6 +22,13 @@ def _long_history(n_exchanges):
 def _cfg(**overrides):
     cfg = dict(config_mod.DEFAULTS)
     cfg["compressor_type"] = "regex"  # keep these tests fully offline
+    # Most of this file exercises the underlying compression mechanisms
+    # directly (keep_messages, selective compression, the aggressive
+    # fallback), not Adaptive Transparency Mode's request-count ramp itself -
+    # pin LIGHT tier so a single optimize_body() call reaches them
+    # immediately. TestAdaptiveTransparencyMode below tests the ramp itself;
+    # other tests that need a different tier override this explicitly.
+    cfg["compression_level"] = "light"
     cfg.update(overrides)
     return cfg
 
@@ -168,8 +175,10 @@ class TestProjectPrimer:
     """The primer injects a project overview on the first request of a session.
     conftest keeps the project state isolated; here we point it at a temp
     project so the primer has something real to scan. Project Cortex supersedes
-    the primer, so these tests disable it (`project_cortex_enabled=False`) to
-    exercise the primer path specifically."""
+    the primer, and both are FULL-tier-only (Adaptive Transparency Mode's
+    "apply full Project Cortex" step) - so these tests disable Cortex
+    (`project_cortex_enabled=False`) *and* pin `compression_level="full"` to
+    exercise the primer path specifically without needing a 16-request ramp."""
 
     @pytest.fixture(autouse=True)
     def temp_project(self, tmp_path, monkeypatch):
@@ -186,6 +195,7 @@ class TestProjectPrimer:
     @staticmethod
     def _pcfg(**kw):
         kw.setdefault("project_cortex_enabled", False)
+        kw.setdefault("compression_level", "full")
         return _cfg(**kw)
 
     def _has_primer(self, new_body):
@@ -228,7 +238,10 @@ class TestProjectPrimer:
 
 
 class TestProjectCortex:
-    """Core Memory (Project DNA) + Session Bridge injection and session flush."""
+    """Core Memory (Project DNA) + Session Bridge injection and session flush.
+    Both are FULL-tier-only (Adaptive Transparency Mode's "apply full Project
+    Cortex" step), so tests pin `compression_level="full"` to reach them
+    without needing a 16-request ramp."""
 
     @pytest.fixture(autouse=True)
     def temp_project(self, tmp_path, monkeypatch):
@@ -253,14 +266,14 @@ class TestProjectCortex:
     def test_core_memory_injected_first_request_only(self):
         body = {"model": "claude-sonnet-5", "system": "base",
                 "messages": _long_history(1)}
-        nb, m = optimize_body(dict(body), _cfg())
+        nb, m = optimize_body(dict(body), _cfg(compression_level="full"))
         assert m["primed"] is True
         s = self._sys(nb)
         assert "CORE MEMORY" in s
         assert "Build the login flow" in s   # the focus is present
         assert "PROJECT PRIMER" not in s       # cortex supersedes the primer
         # Not re-injected on the next request of the same session.
-        _, m2 = optimize_body(dict(body), _cfg())
+        _, m2 = optimize_body(dict(body), _cfg(compression_level="full"))
         assert m2["primed"] is False
 
     def test_session_bridge_injected_when_prior_session_exists(self):
@@ -273,7 +286,7 @@ class TestProjectCortex:
         ])
         body = {"model": "claude-sonnet-5", "system": "base",
                 "messages": _long_history(1)}
-        nb, _ = optimize_body(dict(body), _cfg())
+        nb, _ = optimize_body(dict(body), _cfg(compression_level="full"))
         s = self._sys(nb)
         assert "SESSION BRIDGE" in s
         assert "SQLite" in s  # resumes the prior decision
@@ -281,7 +294,9 @@ class TestProjectCortex:
     def test_cortex_disabled_falls_back_to_primer(self):
         body = {"model": "claude-sonnet-5", "system": "base",
                 "messages": _long_history(1)}
-        nb, m = optimize_body(dict(body), _cfg(project_cortex_enabled=False))
+        nb, m = optimize_body(
+            dict(body), _cfg(compression_level="full", project_cortex_enabled=False)
+        )
         s = self._sys(nb)
         assert "CORE MEMORY" not in s
         assert "PROJECT PRIMER" in s  # primer is the fallback
@@ -306,3 +321,120 @@ class TestProjectCortex:
                 "messages": _long_history(1)}
         _, m = optimize_body(dict(body), _cfg())
         assert m["primed"] is False
+
+
+class TestAdaptiveTransparencyMode:
+    """TokenSnap ramps its own behavior up over a session's lifetime instead
+    of exposing separate "engines" a user has to pick between: requests 1-5
+    pass through untouched, 6-15 add selective compression + a tiny project
+    card, 16+ add the full Differential Context Engine + Project Cortex. See
+    proxy.resolve_tier. `compression_level` can pin one tier instead of
+    ramping."""
+
+    @pytest.fixture(autouse=True)
+    def isolated_db(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(context_store, "DB_FILE", tmp_path / "context_store.db")
+        yield
+
+    def test_first_five_requests_are_transparent_passthrough(self):
+        # A large history throughout, so "nothing was dropped" is meaningful -
+        # not just "there was nothing to compress yet".
+        body = {"model": "claude-sonnet-5", "system": "base",
+                "messages": _long_history(20)}
+        cfg = _cfg(compression_level="adaptive")
+        for i in range(1, 6):
+            new_body, meta = optimize_body(dict(body), cfg)
+            assert meta["tier"] == "transparent", "request %d" % i
+            assert meta["compressed"] is False
+            assert meta["primed"] is False
+            assert len(new_body["messages"]) == len(body["messages"])
+            system = str(new_body.get("system") or "")
+            assert "PROJECT CARD" not in system
+            assert "CORE MEMORY" not in system
+            assert "CONTEXT TREE" not in system
+
+    def test_sixth_request_enters_light_tier_with_compact_card(self, tmp_path):
+        from tokensnap import project
+
+        project.set_current_project(str(tmp_path))
+        (tmp_path / "pyproject.toml").write_text('dependencies = ["flask"]\n', encoding="utf-8")
+
+        cfg = _cfg(compression_level="adaptive")
+        body = {"model": "claude-sonnet-5", "system": "base", "messages": _long_history(1)}
+        for _ in range(5):
+            optimize_body(dict(body), cfg)  # burn through requests 1-5
+        new_body, meta = optimize_body(dict(body), cfg)
+        assert meta["tier"] == "light"
+        assert meta["primed"] is True
+        assert "PROJECT CARD" in str(new_body.get("system"))
+
+    def test_sixteenth_request_enters_full_tier(self):
+        cfg = _cfg(compression_level="adaptive")
+        # Large enough history that the Context Tree actually reconstructs
+        # (short histories are returned unchanged - see test_short_history_
+        # not_reconstructed - which would falsely look like FULL tier failed).
+        body = {"model": "claude-sonnet-5", "system": "base", "messages": _long_history(20)}
+        for _ in range(15):
+            optimize_body(dict(body), cfg)  # burn through requests 1-15
+        new_body, meta = optimize_body(dict(body), cfg)
+        assert meta["tier"] == "full"
+        assert meta["context_store"] is True
+        assert "CONTEXT TREE" in str(new_body.get("system"))
+
+    def test_compression_level_off_pins_transparent_forever(self):
+        cfg = _cfg(compression_level="off")
+        body = {"model": "claude-sonnet-5", "system": "base", "messages": _long_history(1)}
+        for i in range(1, 21):
+            _, meta = optimize_body(dict(body), cfg)
+            assert meta["tier"] == "transparent", "request %d" % i
+
+    def test_compression_level_light_pins_light_from_request_one(self):
+        cfg = _cfg(compression_level="light")
+        body = {"model": "claude-sonnet-5", "system": "base", "messages": _long_history(1)}
+        _, meta = optimize_body(dict(body), cfg)
+        assert meta["tier"] == "light"
+
+    def test_compression_level_full_pins_full_from_request_one(self):
+        cfg = _cfg(compression_level="full")
+        body = {"model": "claude-sonnet-5", "system": "base", "messages": _long_history(1)}
+        _, meta = optimize_body(dict(body), cfg)
+        assert meta["tier"] == "full"
+
+    def test_each_session_ramps_independently(self):
+        cfg = _cfg(compression_level="adaptive")
+        session_a = {"model": "claude-sonnet-5", "system": "A",
+                     "messages": [{"role": "user", "content": "hello A"}]}
+        session_b = {"model": "claude-sonnet-5", "system": "B",
+                     "messages": [{"role": "user", "content": "hello B"}]}
+        for _ in range(16):
+            optimize_body(dict(session_a), cfg)  # ramp session A into FULL
+        _, meta_a = optimize_body(dict(session_a), cfg)
+        assert meta_a["tier"] == "full"
+        # Session B's counter is untouched - still on its first request.
+        _, meta_b = optimize_body(dict(session_b), cfg)
+        assert meta_b["tier"] == "transparent"
+
+    def test_reset_clears_request_counts(self):
+        from tokensnap import proxy as proxy_mod
+
+        cfg = _cfg(compression_level="adaptive")
+        body = {"model": "claude-sonnet-5", "system": "base", "messages": _long_history(1)}
+        for _ in range(6):
+            optimize_body(dict(body), cfg)
+        _, meta_before = optimize_body(dict(body), cfg)
+        assert meta_before["tier"] == "light"  # already past the transparent window
+        proxy_mod.reset_cortex_state()
+        _, meta_after = optimize_body(dict(body), cfg)
+        assert meta_after["tier"] == "transparent"  # counter forgotten - back to request 1
+
+    def test_legacy_context_store_enabled_bypasses_the_ramp(self):
+        # The pre-Adaptive-Transparency-Mode toggle keeps working exactly as
+        # before: differential behavior on every request, independent of tier.
+        cfg = _cfg(compression_level="adaptive", context_store_enabled=True)
+        body = {"model": "claude-sonnet-5", "messages": _long_history(20)}
+        new_body, meta = optimize_body(dict(body), cfg)
+        assert meta["tier"] == "transparent"  # still request #1 by the ramp...
+        assert meta["context_store"] is True   # ...but differential ran anyway
+        # Its keep_exchanges stays at the legacy default (2 -> 4 messages),
+        # not FULL tier's 5 (-> 10), since this session never earned FULL tier.
+        assert len(new_body["messages"]) == 4

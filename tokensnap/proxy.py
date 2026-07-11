@@ -131,11 +131,84 @@ _cortex_primed: set = set()
 _MAX_TRACKED_SESSIONS = 64
 _session_state: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
 
+# Adaptive Transparency Mode - sessions primed with the LIGHT tier's tiny
+# project card this process (separate from _cortex_primed: a session that
+# ramps from LIGHT to FULL gets both, at different points in its life).
+_light_card_primed: set = set()
+# How many /v1/messages requests each live session has made, so behavior can
+# ramp up instead of a user having to pick an "engine". Bounded the same way
+# as _session_state, for the same reason (a long-lived proxy, many sessions).
+_request_counts: "OrderedDict[str, int]" = OrderedDict()
+
+TRANSPARENT_MAX_REQUESTS = 5   # requests 1-5: pass through (only noise-clean)
+LIGHT_MAX_REQUESTS = 15        # requests 6-15: selective compression + tiny card
+                               # requests 16+: full engine suite (below)
+FULL_TIER_KEEP_EXCHANGES = 5   # FULL tier's Differential Context Engine keeps this many
+
 
 def reset_cortex_state() -> None:
-    """Forget primed sessions and tracked message state (used by tests)."""
+    """Forget all per-session proxy state - primed flags, tracked messages,
+    and Adaptive Transparency Mode's request counts (used by tests)."""
     _cortex_primed.clear()
     _session_state.clear()
+    _light_card_primed.clear()
+    _request_counts.clear()
+
+
+def _bump_request_count(session_id: str) -> int:
+    """Increment and return this session's request ordinal (1-based)."""
+    count = _request_counts.get(session_id, 0) + 1
+    _request_counts[session_id] = count
+    _request_counts.move_to_end(session_id)
+    while len(_request_counts) > _MAX_TRACKED_SESSIONS:
+        _request_counts.popitem(last=False)
+    return count
+
+
+def resolve_tier(session_id: str, cfg: Dict[str, Any]) -> str:
+    """The Adaptive Transparency Mode tier for this request: 'transparent',
+    'light', or 'full'.
+
+    The default, "adaptive" (``compression_level``), ramps up over a
+    session's lifetime by request count, so a user never has to pick an
+    "engine" - early replies feel exactly like talking to Claude directly,
+    and the full engine suite only switches on for sessions long enough that
+    the token savings actually matter. ``compression_level`` can pin one tier
+    for every request instead: "off" pins transparent, "light"/"full" pin
+    their namesakes.
+    """
+    count = _bump_request_count(session_id)
+    override = str(cfg.get("compression_level", "adaptive")).lower()
+    if override == "off":
+        return "transparent"
+    if override in ("light", "full"):
+        return override
+    if count <= TRANSPARENT_MAX_REQUESTS:
+        return "transparent"
+    if count <= LIGHT_MAX_REQUESTS:
+        return "light"
+    return "full"
+
+
+def _maybe_add_compact_card(
+    system: Any, session_id: str, cfg: Dict[str, Any]
+) -> Tuple[Any, bool]:
+    """Once per session, add a tiny project-orientation card - the LIGHT
+    tier's minimal alternative to the FULL tier's Project Cortex Core Memory.
+    Returns ``(system, added)``. Never raises."""
+    if session_id in _light_card_primed:
+        return system, False
+    project_dir = project.get_current_project()
+    if not project_dir or project_dir == "unknown":
+        return system, False
+    try:
+        block = project_dna.format_compact_card(project_dna.get_compact_card(project_dir))
+    except Exception:  # noqa: BLE001 - must never break a request
+        return system, False
+    if not block:
+        return system, False
+    _light_card_primed.add(session_id)
+    return append_to_system(system, block), True
 
 
 def _maybe_add_cortex(
@@ -237,63 +310,90 @@ def flush_all_sessions() -> None:
 def optimize_body(
     body: Dict[str, Any], cfg: Dict[str, Any]
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-    """Apply all optimizations to a /v1/messages request body.
+    """Apply Adaptive Transparency Mode to a /v1/messages request body.
+
+    Instead of exposing separate "engines" a user has to choose between,
+    TokenSnap ramps its own behavior up over a session's lifetime (see
+    ``resolve_tier``): early requests pass through untouched (aside from
+    noise cleaning) so the first replies feel exactly like talking to Claude
+    directly, then selective compression plus a tiny project card kick in,
+    then - once a session is long enough that the savings actually matter -
+    the full Differential Context Engine and Project Cortex.
 
     Returns (new_body, meta) where meta holds token accounting for logging.
     """
     messages = body.get("messages")
     model = body.get("model")
     if not isinstance(messages, list) or not messages:
-        return body, {"before": 0, "after": 0, "aggressive": False, "model": model}
+        return body, {"before": 0, "after": 0, "aggressive": False, "model": model,
+                       "tier": "transparent"}
 
     system = body.get("system")
     tokens_before = token_counter.count_message_tokens(messages, system)
-    # Stable id for this conversation, used to prime it exactly once.
-    primer_session = context_engine.derive_session_id(system, messages)
+    # Stable id for this conversation - used to prime it exactly once and to
+    # track how many requests it has made (Adaptive Transparency Mode).
+    session_id = context_engine.derive_session_id(system, messages)
     # Remember the full conversation so Project Cortex can distill it into the
-    # DNA / a Session Bridge when the session ends.
-    _remember_session(primer_session, messages, cfg)
+    # DNA / a Session Bridge when the session ends, regardless of tier.
+    _remember_session(session_id, messages, cfg)
 
-    # Differential Context Engine: instead of a Memory Card, mirror the whole
-    # conversation to the local Context Store and send only the last couple of
-    # exchanges plus a compact Context Tree (+ a fetch_context tool). Opt-in;
-    # when disabled the classic clean+compress path below runs unchanged.
-    if bool(cfg.get("context_store_enabled", False)):
-        return _optimize_differential(
-            body, messages, system, model, tokens_before, cfg, primer_session
+    tier = resolve_tier(session_id, cfg)
+
+    # FULL tier - or the legacy `context_store_enabled` toggle used directly,
+    # which keeps working exactly as before (its own default keep_exchanges),
+    # independent of the adaptive ramp - both route to the Differential
+    # Context Engine + Project Cortex instead of a Memory Card.
+    if tier == "full" or bool(cfg.get("context_store_enabled", False)):
+        keep_exchanges = (
+            FULL_TIER_KEEP_EXCHANGES if tier == "full" else context_engine.KEEP_EXCHANGES
         )
+        new_body, meta = _optimize_differential(
+            body, messages, system, model, tokens_before, cfg, session_id,
+            keep_exchanges=keep_exchanges,
+        )
+        meta["tier"] = tier
+        return new_body, meta
 
-    # 1. Clean terminal noise out of every text payload
+    # TRANSPARENT and LIGHT share the classic clean/compress/safety-net shape;
+    # LIGHT additionally compresses history and adds a tiny project card.
+    # 1. Clean terminal noise out of every text payload - the only thing that
+    #    happens at all in the TRANSPARENT tier.
     messages = _clean_messages(messages)
 
-    # 2. Compress old history into a Memory Card. Selective compression
-    #    (default) first reduces each message to its signal - assistant
-    #    messages untouched, user terminal dumps and tool results trimmed to
-    #    errors/warnings/status - before truncating; legacy mode skips that
-    #    per-message pass and truncates uniformly, matching pre-0.4 behavior.
-    if bool(cfg.get("selective_compression", True)):
-        card, messages = compressor.build_compressed_context(
-            messages,
-            keep_messages=int(cfg["keep_messages"]),
-            cfg=cfg,
-            min_messages=int(cfg["min_messages_to_compress"]),
-        )
-    else:
-        card, messages = compressor.compress_messages(
-            messages,
-            keep_last_n=int(cfg["keep_messages"]),
-            min_messages=int(cfg["min_messages_to_compress"]),
-            llm_cfg=cfg,
-        )
-    if card:
-        system = append_to_system(system, card)
+    # 2. LIGHT tier: compress old history into a Memory Card. Selective
+    #    compression (default) first reduces each message to its signal -
+    #    assistant messages untouched, user terminal dumps and tool results
+    #    trimmed to errors/warnings/status - before truncating; legacy mode
+    #    skips that per-message pass and truncates uniformly.
+    card = None
+    if tier == "light":
+        if bool(cfg.get("selective_compression", True)):
+            card, messages = compressor.build_compressed_context(
+                messages,
+                keep_messages=int(cfg["keep_messages"]),
+                cfg=cfg,
+                min_messages=int(cfg["min_messages_to_compress"]),
+            )
+        else:
+            card, messages = compressor.compress_messages(
+                messages,
+                keep_last_n=int(cfg["keep_messages"]),
+                min_messages=int(cfg["min_messages_to_compress"]),
+                llm_cfg=cfg,
+            )
+        if card:
+            system = append_to_system(system, card)
 
     tokens_after = token_counter.count_message_tokens(messages, system)
 
     # 3. Still near the context window? Get aggressive. This last-resort
-    #    path always uses the uniform legacy truncation (not selective
-    #    compression) - it needs a hard, predictable size cap, which
-    #    per-message compression doesn't guarantee.
+    #    safety net runs regardless of tier (even TRANSPARENT) - a session's
+    #    very first request could already be huge (e.g. a giant pasted log),
+    #    and "transparent" must never mean "can send something the API will
+    #    reject". It rarely fires for normal-sized early sessions. Always uses
+    #    the uniform legacy truncation (not selective compression) - it needs
+    #    a hard, predictable size cap, which per-message compression doesn't
+    #    guarantee.
     aggressive = False
     if token_counter.near_limit(tokens_after, model, float(cfg["context_threshold"])):
         aggressive = True
@@ -309,11 +409,13 @@ def optimize_body(
         system = _truncate_system(system)
         tokens_after = token_counter.count_message_tokens(messages, system)
 
-    # Session opener: Project Cortex Core Memory (or the Project Primer when
-    # Cortex is off). Added after compression so it's never truncated away.
-    system, primed = _maybe_add_context_intro(system, primer_session, cfg)
-    if primed:
-        tokens_after = token_counter.count_message_tokens(messages, system)
+    # Session opener: LIGHT tier gets a tiny project card once; TRANSPARENT
+    # never injects anything, to stay a true pass-through.
+    primed = False
+    if tier == "light":
+        system, primed = _maybe_add_compact_card(system, session_id, cfg)
+        if primed:
+            tokens_after = token_counter.count_message_tokens(messages, system)
 
     new_body = dict(body)
     new_body["messages"] = messages
@@ -329,6 +431,7 @@ def optimize_body(
         "n_messages": len(body.get("messages") or []),
         "n_kept": len(messages),
         "primed": primed,
+        "tier": tier,
     }
     return new_body, meta
 
@@ -341,13 +444,16 @@ def _optimize_differential(
     tokens_before: int,
     cfg: Dict[str, Any],
     primer_session: str,
+    keep_exchanges: int = context_engine.KEEP_EXCHANGES,
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-    """Differential Context Engine path (context_store_enabled).
+    """Differential Context Engine path - the FULL tier of Adaptive
+    Transparency Mode (or the legacy ``context_store_enabled`` toggle used
+    directly, at its own default ``keep_exchanges``).
 
     Cleans noise, mirrors every message into the Context Store, then rebuilds
-    the outgoing request as: the last couple of exchanges (selectively
-    compressed) preceded by a single Context Tree system block, with a
-    fetch_context tool merged in so the model can pull back omitted detail.
+    the outgoing request as: the last few exchanges (selectively compressed)
+    preceded by a single Context Tree system block, with a fetch_context tool
+    merged in so the model can pull back omitted detail.
     """
     cleaned = _clean_messages(messages)
 
@@ -361,6 +467,7 @@ def _optimize_differential(
         tree_size=int(cfg.get("context_tree_size", 20)),
         min_messages=int(cfg["min_messages_to_compress"]),
         selective=bool(cfg.get("selective_compression", True)),
+        keep_exchanges=keep_exchanges,
     )
 
     # Session opener: Project Cortex Core Memory (or the Project Primer when

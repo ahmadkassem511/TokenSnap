@@ -173,6 +173,7 @@ def reconstruct(
     tree_size: int = 20,
     min_messages: int = 8,
     selective: bool = True,
+    keep_exchanges: int = KEEP_EXCHANGES,
 ) -> Tuple[List[Dict[str, Any]], Any, bool, int]:
     """Rebuild the outgoing message list as Context Tree + recent tail.
 
@@ -181,11 +182,13 @@ def reconstruct(
     and system unchanged with ``reconstructed=False`` (the caller then skips
     the fetch_context tool). Reuses ``compressor._find_cut_index`` /
     ``_orphaned_results_to_text`` so tool_use/tool_result pairing is preserved.
+    ``keep_exchanges`` defaults to the module constant but can be overridden
+    (e.g. Adaptive Transparency Mode's FULL tier keeps the last 5).
     """
     if len(messages) <= min_messages:
         return messages, system, False, 0
 
-    cut = compressor._find_cut_index(messages, KEEP_EXCHANGES)
+    cut = compressor._find_cut_index(messages, keep_exchanges)
     if cut <= 0:
         return messages, system, False, 0
 
