@@ -33,7 +33,8 @@ spinning up the aiohttp server.
    (see the MVP philosophy: rule-based heuristics over ML, no telemetry, no
    extra dependencies unless they earn their place).
 3. Add or update tests for any behavior change.
-4. Update `README.md` if you change a command, config key, or default.
+4. Update `ADVANCED.md` if you change a command, config key, or default
+   (`README.md` is intentionally minimal - see its own note on that).
 5. Run `pytest` locally before opening a PR — CI runs the same suite.
 
 ## Code style
