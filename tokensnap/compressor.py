@@ -335,10 +335,10 @@ def compress_messages(
 # unless they contain a large terminal/log dump, in which case only that
 # dump is reduced to its error/warning/status lines. Tool results are
 # compressed the same way, more aggressively, since they're almost always
-# machine-generated noise once the outcome is known - EXCEPT a file read
-# (Read/View/Open, or a pure unchained "cat"/"type"/"Get-Content"/... shell
-# command): that result *is* the substance Claude asked to see, so it is
-# never compressed, in any tier (see _is_read_only_tool_call).
+# machine-generated noise once the outcome is known - EXCEPT a read
+# (Read/View/Open/Grep/Glob, or a pure unchained "cat"/"type"/"Get-Content"/...
+# shell command): that result *is* the substance Claude asked to see, so it
+# is never compressed, in any tier (see _is_read_only_tool_call).
 # ---------------------------------------------------------------------------
 
 # A user or tool_result text block bigger than this is a candidate for
@@ -446,10 +446,13 @@ def _compress_tool_result_text(text: str) -> str:
     return _extract_signal_lines(text)
 
 
-# Dedicated read tools whose result *is* file content - compressing it would
-# blind Claude to what it just asked to see, defeating the point of reading.
-# Matched case-insensitively against the tool_use block's exact `name`.
-_READ_TOOL_NAMES = {"read", "view", "open"}
+# Dedicated read tools whose result *is* the content Claude asked to see -
+# compressing it would blind Claude to that content, defeating the point of
+# calling the tool. Matched case-insensitively against the tool_use block's
+# exact `name`. Read/View/Open return a file's contents; Grep/Glob return
+# search matches / matched paths - equally substantive, equally wrong to
+# summarize down to "errors and warnings" (a grep result may contain neither).
+_READ_TOOL_NAMES = {"read", "view", "open", "grep", "glob"}
 # Shell verbs that only ever read a file, invoked through the Bash tool - "cat",
 # not "Bash", is what the user actually asked to run, so it needs its own,
 # narrower check (see _is_read_only_tool_call).
@@ -463,9 +466,9 @@ _SHELL_COMPOSITION_RE = re.compile(r"[|&;><]")
 def _is_read_only_tool_call(
     tool_name: Optional[str], tool_input: Optional[Dict[str, Any]]
 ) -> bool:
-    """True when a tool_use call is a pure file read whose result must never
-    be summarized away: either a dedicated read tool (Read/View/Open), or a
-    Bash call whose *entire* command is a single read-only verb with no
+    """True when a tool_use call is a pure read whose result must never be
+    summarized away: either a dedicated read tool (Read/View/Open/Grep/Glob),
+    or a Bash call whose *entire* command is a single read-only verb with no
     piping/chaining/redirection.
     """
     name = str(tool_name or "").strip().lower()

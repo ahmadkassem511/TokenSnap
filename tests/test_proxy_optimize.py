@@ -130,6 +130,36 @@ class TestSelectiveCompressionPlumbing:
         assert by_id["r1"] == big_file  # Read result: byte-identical, no [tokensnap] tag
         assert "tokensnap" in by_id["b1"] and len(by_id["b1"]) < len(npm_output)
 
+    def test_grep_tool_result_never_compressed_but_bash_still_is(self):
+        # Same guarantee, extended to Grep (a search result is equally
+        # substantive as a raw file read - it may contain no error/warning
+        # signal words at all, so generic compression would gut it).
+        matches = "\n".join("src/file%d.py:%d: TODO fix this" % (i, i) for i in range(300))
+        npm_output = ("\n".join("npm log line %d" % i for i in range(300))
+                      + "\nnpm WARN deprecated foo\nadded 200 packages in 5s")
+        msgs = [
+            {"role": "user", "content": "find all TODOs and then run npm install"},
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "g1", "name": "Grep", "input": {"pattern": "TODO"}}]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "g1", "content": matches}]},
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "b1", "name": "Bash", "input": {"command": "npm install"}}]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "b1", "content": npm_output}]},
+        ]
+        body = {"model": "claude-sonnet-5", "messages": msgs}
+        new_body, _ = optimize_body(body, _cfg())
+        by_id = {
+            b["tool_use_id"]: b["content"]
+            for m in new_body["messages"]
+            if isinstance(m.get("content"), list)
+            for b in m["content"]
+            if isinstance(b, dict) and b.get("type") == "tool_result"
+        }
+        assert by_id["g1"] == matches  # Grep result: byte-identical, no [tokensnap] tag
+        assert "tokensnap" in by_id["b1"] and len(by_id["b1"]) < len(npm_output)
+
 
 class TestAggressiveThreshold:
     def test_not_aggressive_when_under_threshold(self):

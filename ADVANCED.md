@@ -283,14 +283,18 @@ based on its role:
   they're almost always machine-generated noise once the outcome is known.
   A 200-line build log becomes a couple of error lines plus something like
   `[tokensnap: 180 lines omitted (2 errors, 1 warning)]`.
-- **File reads are the one exception.** A `Read`/`View`/`Open` tool result -
-  or a `Bash` call whose entire command is a single unchained read (`cat`,
-  `type`, `Get-Content`, `head`, `tail`, `more`, `less` — no `|`, `&&`, `;`,
-  `>`/`<`) - is passed through completely untouched, in every tier. That
-  result *is* the file content Claude asked to see; summarizing it would
-  defeat the point of reading in the first place. A command that does more
-  than read (`cat file.txt && rm file.txt`) is correctly not exempted just
-  because it starts with a read verb.
+- **Reads are the one exception.** A `Read`/`View`/`Open`/`Grep`/`Glob` tool
+  result - or a `Bash` call whose entire command is a single unchained read
+  (`cat`, `type`, `Get-Content`, `head`, `tail`, `more`, `less` — no `|`,
+  `&&`, `;`, `>`/`<`) - is passed through completely untouched, in every
+  tier. That result *is* the content (or search matches) Claude asked to
+  see; summarizing it would defeat the point of asking in the first place -
+  a Grep result, for instance, may contain no error/warning signal words at
+  all, so generic compression would gut it rather than trim noise. A command
+  that does more than read (`cat file.txt && rm file.txt`) is correctly not
+  exempted just because it starts with a read verb; a raw shell `grep`
+  (as opposed to the dedicated `Grep` tool) isn't auto-exempted either, since
+  it's commonly just one stage of a longer pipeline.
 
 Set `selective_compression = false` (or use `tokensnap preset complex`) to
 go back to the legacy behavior: no per-message cleaning, just uniform

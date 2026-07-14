@@ -322,6 +322,41 @@ class TestReadToolNeverCompressed:
             out = self._compress_all(msgs)
             assert out[2]["content"][0]["content"] == big_file, name
 
+    def test_grep_tool_result_never_compressed(self):
+        # Many matches across a big codebase - the kind of result that would
+        # otherwise exceed the compression threshold and get reduced to
+        # "errors and warnings" (a grep result may have neither).
+        matches = "\n".join(
+            "src/file%d.py:%d: TODO fix this" % (i, i) for i in range(300)
+        )
+        msgs = _read_tool_convo("Grep", {"pattern": "TODO"}, matches)
+        out = self._compress_all(msgs)
+        assert out[2]["content"][0]["content"] == matches
+
+    def test_glob_tool_result_never_compressed(self):
+        paths = "\n".join("src/module%d/file%d.py" % (i, i) for i in range(300))
+        msgs = _read_tool_convo("Glob", {"pattern": "**/*.py"}, paths)
+        out = self._compress_all(msgs)
+        assert out[2]["content"][0]["content"] == paths
+
+    def test_grep_and_glob_case_insensitive(self):
+        content = "\n".join("match %d" % i for i in range(300))
+        for name in ("grep", "GREP", "Glob", "GLOB"):
+            msgs = _read_tool_convo(name, {}, content)
+            out = self._compress_all(msgs)
+            assert out[2]["content"][0]["content"] == content, name
+
+    def test_grep_invoked_via_bash_is_not_auto_exempt(self):
+        # The dedicated "Grep" tool is exempt; a raw shell `grep` command run
+        # through Bash is not - "grep" isn't a pure single-purpose read verb
+        # the way cat/type are, and is very often part of a longer pipeline.
+        # This deliberately stays conservative (falls back to normal Bash
+        # handling, which still compresses only past the size threshold).
+        big_output = "\n".join("match %d" % i for i in range(500))
+        msgs = _read_tool_convo("Bash", {"command": "grep TODO file.py"}, big_output)
+        out = self._compress_all(msgs)
+        assert out[2]["content"][0]["content"] != big_output
+
     def test_pure_shell_read_commands_are_exempt(self):
         big_file = "\n".join("line %d of the file" % i for i in range(500))
         for command in ("cat file.txt", "type file.txt", "Get-Content -Path file.txt",
